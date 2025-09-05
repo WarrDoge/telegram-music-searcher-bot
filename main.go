@@ -60,6 +60,11 @@ type OEmbedResponse struct {
 	Description string `json:"description"`
 }
 
+// --- Extra cleanup helpers ---
+var reAppleMusicSuffix = regexp.MustCompile(`(?i)\s+(?:on|в|у|na|en|sur|su|auf|no|em|di|de|a)\s+apple\s*music`)
+var rePlatformNames   = regexp.MustCompile(`(?i)\b(?:apple\s*music|spotify|youtube(?:\s*music)?)\b`)
+var fancyQuotes = strings.NewReplacer("«", "", "»", "", "“", "", "”", "", "„", "", "‘", "", "’", "")
+
 // ---------------------------
 // Globals & Regex
 // ---------------------------
@@ -106,7 +111,8 @@ func NewMusicBot(config *Config) (*MusicBot, error) {
 	bot.Debug = config.Debug
 	log.Printf("Authorized on account %s (debug=%v)", bot.Self.UserName, bot.Debug)
 
-	client := &http.Client{Transport: defaultTransport}
+	// Use a client-level timeout so callers can safely read resp.Body.
+	client := &http.Client{Transport: defaultTransport, Timeout: 12 * time.Second}
 
 	return &MusicBot{
 		config:      config,
@@ -317,9 +323,8 @@ func (mb *MusicBot) fetchCtx(ctx context.Context, target string) (*http.Response
 }
 
 func (mb *MusicBot) fetch(target string) (*http.Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	defer cancel()
-	return mb.fetchCtx(ctx, target)
+	// No per-request cancel here; rely on http.Client.Timeout above.
+	return mb.fetchCtx(context.Background(), target)
 }
 
 func joinApple(base, href string) string {
@@ -331,6 +336,22 @@ func joinApple(base, href string) string {
 		return "https://music.apple.com" + href
 	}
 	return u.Scheme + "://" + u.Host + href
+}
+
+func cleanPlatformNoise(s string) string {
+	// normalize spaces (incl. NBSP), drop localized "… Apple Music" suffixes,
+	// remove platform brand words and fancy quotes.
+	s = strings.ReplaceAll(s, "\u00A0", " ")
+	s = reAppleMusicSuffix.ReplaceAllString(s, "")
+	s = rePlatformNames.ReplaceAllString(s, "")
+	s = fancyQuotes.Replace(s)
+	return strings.TrimSpace(s)
+}
+
+func cleanTitleArtist(t, a string) (string, string) {
+	t = cleanPlatformNoise(t)
+	a = cleanPlatformNoise(a)
+	return t, a
 }
 
 // ---------------------------
@@ -349,6 +370,11 @@ func normalizeQuery(artist, title string) string {
 			" official video", "", " lyric video", "", " lyrics", "",
 		}
 		ls := strings.ToLower(s)
+		ls = strings.ReplaceAll(ls, "\u00A0", " ")
+		// strip platform noise early (handles “в/у/on Apple Music”, etc.)
+		ls = reAppleMusicSuffix.ReplaceAllString(ls, "")
+		ls = rePlatformNames.ReplaceAllString(ls, "")
+		ls = fancyQuotes.Replace(ls)
 		for i := 0; i < len(repls); i += 2 {
 			ls = strings.ReplaceAll(ls, repls[i], repls[i+1])
 		}
@@ -367,6 +393,8 @@ func normalizeForMatch(s string) string {
 		"-", " ", "—", " ", "–", " ", "·", " ", ".", " ", ",", " ",
 		"!", " ", "?", " ", "/", " ", "&", " and ", "'", " ", "’", " ",
 	).Replace(s)
+	s = fancyQuotes.Replace(s)
+	s = rePlatformNames.ReplaceAllString(s, "")
 	s = strings.Join(strings.Fields(s), " ")
 	return s
 }
@@ -597,6 +625,10 @@ func (mb *MusicBot) getAppleMusicInfo(appleURL string) *SongInfo {
 			artist = strings.TrimSuffix(strings.TrimSpace(parts[1]), " в Apple Music")
 		}
 	}
+
+	// Final cleanup in case JSON-LD/og:title is localized
+	title, artist = cleanTitleArtist(title, artist)
+
 	title = strings.ReplaceAll(title, " - Single", "")
 	title = strings.ReplaceAll(title, " - EP", "")
 	title = strings.ReplaceAll(title, " - Album", "")
@@ -606,6 +638,16 @@ func (mb *MusicBot) getAppleMusicInfo(appleURL string) *SongInfo {
 	if title == "" {
 		return nil
 	}
+
+	// Fallback: if artist is still empty and og:title looked like "Title, Artist"
+	if strings.TrimSpace(artist) == "" && strings.Contains(title, ",") {
+		parts := strings.Split(title, ",")
+		if len(parts) >= 2 {
+			title = strings.TrimSpace(strings.Join(parts[:len(parts)-1], ","))
+			artist = strings.TrimSpace(parts[len(parts)-1])
+		}
+	}
+
 	out := &SongInfo{Title: strings.TrimSpace(title), Artist: strings.TrimSpace(artist), Platform: "Apple Music", OriginalURL: appleURL}
 	if b, err := json.Marshal(out); err == nil {
 		mb.urlCache.Set("info:"+appleURL, string(b), 24*time.Hour)
@@ -841,7 +883,7 @@ func (mb *MusicBot) searchSpotify(info *SongInfo) string {
 		}()
 	}
 
-	// DDG fallback (reliable, no API keys)
+	// DDG fallback (reliable, no API keys) — prefer quoted exact match when possible
 	if u := mb.searchSpotifyViaDDG(info.Artist, info.Title); u != "" {
 		mb.queryCache.Set("sp:"+key, u, 24*time.Hour)
 		return u
@@ -853,7 +895,16 @@ func (mb *MusicBot) searchSpotify(info *SongInfo) string {
 
 // Optional DuckDuckGo HTML fallback (now used whenever primary fails)
 func (mb *MusicBot) searchSpotifyViaDDG(artist, title string) string {
-	q := "site:open.spotify.com/track " + normalizeQuery(artist, title)
+	t := normalizeForMatch(title)
+	a := normalizeForMatch(artist)
+	parts := []string{"site:open.spotify.com/track"}
+	if t != "" {
+		parts = append(parts, fmt.Sprintf("\"%s\"", t))
+	}
+	if a != "" {
+		parts = append(parts, fmt.Sprintf("\"%s\"", a))
+	}
+	q := strings.Join(parts, " ")
 	ddg := "https://duckduckgo.com/html/?q=" + url.QueryEscape(q)
 
 	resp, err := mb.fetch(ddg)
