@@ -61,8 +61,10 @@ type OEmbedResponse struct {
 }
 
 // --- Extra cleanup helpers ---
+// NB: Go's RE2 doesn't support \u escapes inside regex literals, so we normalize NBSP in code,
+// and make regexes use ordinary \s instead of trying to match NBSP directly.
 var reAppleMusicSuffix = regexp.MustCompile(`(?i)\s+(?:on|в|у|na|en|sur|su|auf|no|em|di|de|a)\s+apple\s*music`)
-var rePlatformNames   = regexp.MustCompile(`(?i)\b(?:apple\s*music|spotify|youtube(?:\s*music)?)\b`)
+var rePlatformNames = regexp.MustCompile(`(?i)\b(?:apple\s*music|spotify|youtube(?:\s*music)?)\b`)
 var fancyQuotes = strings.NewReplacer("«", "", "»", "", "“", "", "”", "", "„", "", "‘", "", "’", "")
 
 // ---------------------------
@@ -79,7 +81,7 @@ var (
 	reSpotifyURI   = regexp.MustCompile(`spotify:track:([A-Za-z0-9]+)`)                   // embedded URIs in scripts
 
 	reParenBlock = regexp.MustCompile(`\s*[\(\[][^)\]]*[\)\]]`)
-	reFeat       = regexp.MustCompile(`(?i)\s*(feat\.?|featuring)\s+[^-–—·,]+`)
+	reFeat       = regexp.MustCompile(`(?i)\s*(feat\.?|featuring)\s+[-–—·,]*[^-–—·,]+`)
 )
 
 // seed RNG for backoff jitter
@@ -825,7 +827,42 @@ func (mb *MusicBot) searchYouTubeViaPage(searchURL string, info *SongInfo) strin
 	return ""
 }
 
-// Spotify: JSON/regex/anchors; now with reliable DDG fallback regardless of config
+// ---------------------------
+// Spotify search (now with robust DDG fallback returning a direct /track URL)
+// ---------------------------
+
+// canonicalize any Spotify URL that contains a track id (incl. intl-xx prefix, query, etc.)
+func canonicalSpotifyTrack(u string) string {
+	if m := reSpotifyTrack.FindStringSubmatch(u); len(m) == 2 {
+		return "https://open.spotify.com/track/" + m[1]
+	}
+	return ""
+}
+
+// unwrap DuckDuckGo redirect /l/?uddg=... and normalize
+func resolveDDGLink(href string) string {
+	if href == "" {
+		return ""
+	}
+	u := href
+	if strings.HasPrefix(u, "//") {
+		u = "https:" + u
+	} else if strings.HasPrefix(u, "/") && !strings.HasPrefix(u, "/track/") {
+		u = "https://duckduckgo.com" + u
+	}
+	if ru, err := url.Parse(u); err == nil {
+		if strings.Contains(ru.Host, "duckduckgo.com") && strings.HasPrefix(ru.Path, "/l/") {
+			if v := ru.Query().Get("uddg"); v != "" {
+				if dec, err := url.QueryUnescape(v); err == nil {
+					return dec
+				}
+				return v
+			}
+		}
+	}
+	return u
+}
+
 func (mb *MusicBot) searchSpotify(info *SongInfo) string {
 	key := normalizeQuery(info.Artist, info.Title)
 	if v, ok := mb.queryCache.Get("sp:" + key); ok {
@@ -865,12 +902,11 @@ func (mb *MusicBot) searchSpotify(info *SongInfo) string {
 				var track string
 				doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
 					href, _ := a.Attr("href")
-					if m := reSpotifyTrack.FindStringSubmatch(href); len(m) == 2 {
-						if strings.HasPrefix(href, "http") {
-							track = href
-						} else {
-							track = "https://open.spotify.com" + href
-						}
+					if href == "" {
+						return true
+					}
+					if u := canonicalSpotifyTrack(href); u != "" {
+						track = u
 						return false
 					}
 					return true
@@ -883,8 +919,8 @@ func (mb *MusicBot) searchSpotify(info *SongInfo) string {
 		}()
 	}
 
-	// DDG fallback (reliable, no API keys) — prefer quoted exact match when possible
-	if u := mb.searchSpotifyViaDDG(info.Artist, info.Title); u != "" {
+	// DDG fallback (reliable, no API keys) — try exact quoted, then loose
+	if u := mb.searchSpotifyViaDDG2(info.Artist, info.Title); u != "" {
 		mb.queryCache.Set("sp:"+key, u, 24*time.Hour)
 		return u
 	}
@@ -893,48 +929,78 @@ func (mb *MusicBot) searchSpotify(info *SongInfo) string {
 	return searchURL
 }
 
-// Optional DuckDuckGo HTML fallback (now used whenever primary fails)
-func (mb *MusicBot) searchSpotifyViaDDG(artist, title string) string {
+func (mb *MusicBot) searchSpotifyViaDDG2(artist, title string) string {
+	// pass 1: exact (quoted) — best precision
 	t := normalizeForMatch(title)
 	a := normalizeForMatch(artist)
 	parts := []string{"site:open.spotify.com/track"}
 	if t != "" {
-		parts = append(parts, fmt.Sprintf("\"%s\"", t))
+		parts = append(parts, fmt.Sprintf(`"%s"`, t))
 	}
 	if a != "" {
-		parts = append(parts, fmt.Sprintf("\"%s\"", a))
+		parts = append(parts, fmt.Sprintf(`"%s"`, a))
 	}
 	q := strings.Join(parts, " ")
 	ddg := "https://duckduckgo.com/html/?q=" + url.QueryEscape(q)
 
 	resp, err := mb.fetch(ddg)
 	if err != nil {
-		if mb.config.Debug {
-			log.Printf("DDG fetch failed: %v", err)
-		}
 		return ""
 	}
 	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		if mb.config.Debug {
-			log.Printf("DDG parse failed: %v", err)
-		}
 		return ""
 	}
 
 	found := ""
 	doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
 		href, _ := a.Attr("href")
-		if strings.HasPrefix(href, "https://open.spotify.com/track/") {
-			found = href
+		u := resolveDDGLink(href)
+		if track := canonicalSpotifyTrack(u); track != "" {
+			found = track
+			return false
+		}
+		return true
+	})
+	if found != "" {
+		return found
+	}
+
+	// pass 2: loose — better recall for tricky scripts/diacritics
+	if t == "" && a == "" {
+		return ""
+	}
+	q2 := "site:open.spotify.com/track " + strings.TrimSpace(t+" "+a)
+	ddg2 := "https://duckduckgo.com/html/?q=" + url.QueryEscape(q2)
+
+	resp2, err := mb.fetch(ddg2)
+	if err != nil {
+		return ""
+	}
+	defer func() { io.Copy(io.Discard, resp2.Body); resp2.Body.Close() }()
+
+	doc2, err := goquery.NewDocumentFromReader(resp2.Body)
+	if err != nil {
+		return ""
+	}
+
+	doc2.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
+		href, _ := a.Attr("href")
+		u := resolveDDGLink(href)
+		if track := canonicalSpotifyTrack(u); track != "" {
+			found = track
 			return false
 		}
 		return true
 	})
 	return found
 }
+
+// ---------------------------
+// Apple helpers
+// ---------------------------
 
 func storefrontFromAppleURL(u *url.URL) string {
 	// formats: /us/album/... or /ua/song/...
