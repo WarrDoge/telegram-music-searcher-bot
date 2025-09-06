@@ -58,6 +58,7 @@ type MusicBot struct {
 type OEmbedResponse struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
+	AuthorName  string `json:"author_name"`
 }
 
 // --- Extra cleanup helpers ---
@@ -81,9 +82,12 @@ var (
 	reSpotifyURI   = regexp.MustCompile(`spotify:track:([A-Za-z0-9]+)`)                   // embedded URIs in scripts
 	// NEW: detect Spotify album URLs so we can resolve them to a track
 	reSpotifyAlbum = regexp.MustCompile(`(?:^|/)(?:intl-[a-z]{2}/)?album/([A-Za-z0-9]+)`)
-
-	reParenBlock = regexp.MustCompile(`\s*[\(\[][^)\]]*[\)\]]`)
-	reFeat       = regexp.MustCompile(`(?i)\s*(feat\.?|featuring)\s+[-–—·,]*[^-–—·,]+`)
+	reParenBlock   = regexp.MustCompile(`\s*[\(\[][^\)\]]*[\)\]]`)
+	reFeat         = regexp.MustCompile(`(?i)\s*(feat\.?|featuring)\s+[-–—·,]*[^-–—·,]+`)
+	// NEW: robust splitter for Spotify description separators
+	reMidDotSep = regexp.MustCompile(`\s*[·•]\s*`)
+	// NEW: dash variants used in og:title like "Title — Artist"
+	reDash = regexp.MustCompile(`\s*[-–—]\s*`)
 )
 
 // seed RNG for backoff jitter
@@ -185,12 +189,27 @@ func (mb *MusicBot) handleMessage(m *tgbotapi.Message) {
 
 	artist := info.Artist
 	if strings.TrimSpace(artist) == "" {
-		artist = "Unknown Artist"
+		artist = "Unknown Artist" // placeholder ONLY for display; we do not store this sentinel
 	}
 
 	mb.sendReply(chatID, replyTo, md2(fmt.Sprintf("🔍 Found: *%s* by *%s*\n\nSearching other platforms…", info.Title, artist)))
 
 	links := mb.findOnAllPlatforms(info)
+
+	// Enrich missing artist using other platform results (UX polish).
+	if strings.TrimSpace(info.Artist) == "" {
+		if links.AppleMusic != "" {
+			if si := mb.getAppleMusicInfo(links.AppleMusic); si != nil && strings.TrimSpace(si.Artist) != "" {
+				info.Artist = si.Artist
+			}
+		}
+		if strings.TrimSpace(info.Artist) == "" && links.YouTubeMusic != "" {
+			if si := mb.getYouTubeInfo(links.YouTubeMusic, "YouTube Music"); si != nil && strings.TrimSpace(si.Artist) != "" {
+				info.Artist = si.Artist
+			}
+		}
+	}
+
 	if links.Spotify == "" && links.YouTubeMusic == "" && links.AppleMusic == "" {
 		mb.sendReply(chatID, replyTo, md2("😕 I couldn't find matches on other platforms. It might be a regional or rare release."))
 		return
@@ -358,6 +377,34 @@ func cleanTitleArtist(t, a string) (string, string) {
 	return t, a
 }
 
+// Heuristics: detect album-like strings and artist lists to avoid swapping errors
+func isAlbumish(s string) bool {
+	ls := strings.ToLower(strings.TrimSpace(s))
+	if ls == "" {
+		return false
+	}
+	hints := []string{"original soundtrack", "soundtrack", "ost", "score", "music from", "season ", " vol.", " volume ", ":"}
+	for _, h := range hints {
+		if strings.Contains(ls, h) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeArtistList(s string) bool {
+	ls := strings.ToLower(strings.TrimSpace(s))
+	if ls == "" {
+		return false
+	}
+	if strings.Contains(ls, ",") || strings.Contains(ls, " & ") || strings.Contains(ls, " and ") || strings.Contains(ls, " feat") || strings.Contains(ls, " featuring ") {
+		if !strings.Contains(ls, ":") && !strings.Contains(ls, "-") {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------
 // Normalization helpers
 // ---------------------------
@@ -407,6 +454,64 @@ func normalizeForMatch(s string) string {
 // Platform parsers
 // ---------------------------
 
+// splitFromOgTitle tries to robustly extract (title, artist) from Spotify og:title,
+// using og:description as a hint (its first token is almost always the artist).
+func splitFromOgTitle(ogTitle, ogDesc string) (title, artist string) {
+	if ogTitle == "" {
+		return "", ""
+	}
+	t := strings.TrimSpace(strings.TrimSuffix(ogTitle, " | Spotify"))
+	t = strings.ReplaceAll(t, "\u00A0", " ")
+
+	// Case 1: "... by ..." (localized pages often still use " by ")
+	if idx := strings.Index(strings.ToLower(t), " by "); idx != -1 {
+		return strings.TrimSpace(t[:idx]), strings.TrimSpace(t[idx+4:])
+	}
+
+	// Case 2: dash variants "Left — Right" which could be "Title — Artist" or "Artist — Title"
+	parts := reDash.Split(t, 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	left, right := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+
+	// Derive a hint for artist from description ("Artist · Album")
+	var hintArtist string
+	if ogDesc != "" {
+		ds := reMidDotSep.Split(strings.ReplaceAll(ogDesc, "\u00A0", " "), -1)
+		if len(ds) >= 1 {
+			hintArtist = strings.TrimSpace(ds[0])
+		}
+	}
+
+	ln := normalizeForMatch(left)
+	rn := normalizeForMatch(right)
+	an := normalizeForMatch(hintArtist)
+
+	// If one side equals hint artist, we know the orientation
+	if an != "" {
+		if ln == an {
+			// "Artist — Title"
+			return right, left
+		}
+		if rn == an {
+			// "Title — Artist"
+			return left, right
+		}
+	}
+
+	// Heuristic: channels/artists look like lists more than titles do
+	if looksLikeArtistList(right) {
+		return left, right
+	}
+	if looksLikeArtistList(left) {
+		return right, left
+	}
+
+	// Default assumption: "Title — Artist"
+	return left, right
+}
+
 func (mb *MusicBot) getSpotifyInfo(spotifyURL string) *SongInfo {
 	if v, ok := mb.urlCache.Get("info:" + spotifyURL); ok {
 		var si SongInfo
@@ -434,13 +539,113 @@ func (mb *MusicBot) getSpotifyInfo(spotifyURL string) *SongInfo {
 		}
 		return mb.fallbackSpotifyScrape(spotifyURL)
 	}
-	parts := strings.Split(oembed.Title, " · ")
-	var si *SongInfo
-	if len(parts) >= 2 {
-		si = &SongInfo{Title: strings.TrimSpace(parts[0]), Artist: strings.TrimSpace(parts[1]), Platform: "Spotify", OriginalURL: spotifyURL}
-	} else {
-		si = &SongInfo{Title: strings.TrimSpace(oembed.Title), Artist: "Unknown Artist", Platform: "Spotify", OriginalURL: spotifyURL}
+
+	// Start with oEmbed fields
+	title := strings.TrimSpace(oembed.Title)
+	artist := strings.TrimSpace(oembed.AuthorName)
+
+	// Clean common suffixes
+	title = strings.TrimSuffix(title, " | Spotify")
+	title = strings.NewReplacer(" — ", " - ", " – ", " - ").Replace(title)
+
+	// Use description ONLY to fill missing fields. Don't overwrite good values.
+	if desc := strings.TrimSpace(oembed.Description); desc != "" && (strings.TrimSpace(title) == "" || strings.TrimSpace(artist) == "") {
+		parts := reMidDotSep.Split(strings.ReplaceAll(desc, "\u00A0", " "), -1)
+
+		// If artist is missing, try to pick the part that isn't the known title and isn't album-ish.
+		if strings.TrimSpace(artist) == "" && len(parts) >= 2 {
+			p0, p1 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			switch {
+			case title != "" && strings.EqualFold(p0, title):
+				artist = p1
+			case title != "" && strings.EqualFold(p1, title):
+				artist = p0
+			case isAlbumish(p0) && !isAlbumish(p1):
+				artist = p1
+			case isAlbumish(p1) && !isAlbumish(p0):
+				artist = p0
+			default:
+				// default best guess: second token tends to be artist more often than album
+				artist = p1
+			}
+		}
+
+		// If title is missing, try to pick the part that isn't the known artist and isn't album-ish.
+		if strings.TrimSpace(title) == "" && len(parts) >= 2 {
+			p0, p1 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			switch {
+			case artist != "" && strings.EqualFold(p0, artist):
+				title = p1
+			case artist != "" && strings.EqualFold(p1, artist):
+				title = p0
+			case !isAlbumish(p0) && isAlbumish(p1):
+				title = p0
+			case !isAlbumish(p1) && isAlbumish(p0):
+				title = p1
+			default:
+				// default best guess: first token is often the track title
+				title = p0
+			}
+		}
 	}
+
+	// If artist is still empty, try to infer from oEmbed title (case-insensitive " by ")
+	if strings.TrimSpace(artist) == "" {
+		if tl := strings.ToLower(title); strings.Contains(tl, " by ") {
+			if idx := strings.Index(tl, " by "); idx != -1 {
+				left := strings.TrimSpace(title[:idx])
+				right := strings.TrimSpace(title[idx+4:])
+				if left != "" && right != "" {
+					title, artist = left, right
+				}
+			}
+		} else if strings.Contains(title, " · ") {
+			p := strings.SplitN(title, " · ", 2)
+			title = strings.TrimSpace(p[0])
+			artist = strings.TrimSpace(p[1])
+		} else if strings.Contains(title, " - ") {
+			p := strings.SplitN(title, " - ", 2)
+			left, right := strings.TrimSpace(p[0]), strings.TrimSpace(p[1])
+			title, artist = left, right
+		}
+	}
+
+	// If parsing looks wrong (album-ish), artist empty, or title==artist — scrape HTML.
+	if strings.TrimSpace(artist) == "" || isAlbumish(artist) || (looksLikeArtistList(title) && !looksLikeArtistList(artist)) || strings.EqualFold(title, artist) {
+		if si := mb.fallbackSpotifyScrape(spotifyURL); si != nil {
+			if si.Title != "" && si.Artist != "" {
+				if b, err := json.Marshal(si); err == nil {
+					mb.urlCache.Set("info:"+spotifyURL, string(b), 24*time.Hour)
+				}
+				return si
+			}
+			if strings.TrimSpace(artist) == "" && strings.TrimSpace(si.Artist) != "" {
+				artist = si.Artist
+			}
+			if strings.TrimSpace(title) == "" && strings.TrimSpace(si.Title) != "" {
+				title = si.Title
+			}
+		}
+	}
+
+	// Final fallback if title missing
+	if strings.TrimSpace(title) == "" {
+		if si := mb.fallbackSpotifyScrape(spotifyURL); si != nil {
+			if b, err := json.Marshal(si); err == nil {
+				mb.urlCache.Set("info:"+spotifyURL, string(b), 24*time.Hour)
+			}
+			return si
+		}
+	}
+
+	// Extra sanity: if we still landed on album in the artist field or got a self-equal, try scrape once more
+	if isAlbumish(artist) || strings.EqualFold(title, artist) {
+		if si := mb.fallbackSpotifyScrape(spotifyURL); si != nil && si.Title != "" && si.Artist != "" {
+			title, artist = si.Title, si.Artist
+		}
+	}
+
+	si := &SongInfo{Title: title, Artist: artist, Platform: "Spotify", OriginalURL: spotifyURL}
 	if b, err := json.Marshal(si); err == nil {
 		mb.urlCache.Set("info:"+spotifyURL, string(b), 24*time.Hour)
 	}
@@ -464,24 +669,53 @@ func (mb *MusicBot) fallbackSpotifyScrape(spotifyURL string) *SongInfo {
 		}
 		return nil
 	}
-	title := doc.Find("meta[property='og:title']").AttrOr("content", "")
-	description := doc.Find("meta[property='og:description']").AttrOr("content", "")
+	ogTitle := doc.Find("meta[property='og:title']").AttrOr("content", "")
+	ogDesc := doc.Find("meta[property='og:description']").AttrOr("content", "")
 
-	if title != "" {
-		title = strings.ReplaceAll(title, " - song and lyrics by ", " - ")
-		title = strings.ReplaceAll(title, " - song by ", " - ")
-		parts := strings.Split(title, " - ")
-		if len(parts) >= 2 {
-			return &SongInfo{Title: strings.TrimSpace(parts[0]), Artist: strings.TrimSpace(parts[1]), Platform: "Spotify", OriginalURL: spotifyURL}
+	// 1) Try robust split from og:title, using og:description as hint
+	if ti, ar := splitFromOgTitle(ogTitle, ogDesc); ti != "" && ar != "" {
+		return &SongInfo{Title: ti, Artist: ar, Platform: "Spotify", OriginalURL: spotifyURL}
+	}
+
+	// 2) Fallback to earlier og:title heuristics
+	if ogTitle != "" {
+		title := strings.TrimSuffix(ogTitle, " | Spotify")
+		title = strings.NewReplacer(
+			" — ", " - ",
+			" – ", " - ",
+			" - song and lyrics by ", " - ",
+			" - song by ", " - ",
+		).Replace(title)
+		if idx := strings.Index(strings.ToLower(title), " by "); idx != -1 {
+			t := strings.TrimSpace(title[:idx])
+			a := strings.TrimSpace(title[idx+4:])
+			if t != "" && a != "" {
+				return &SongInfo{Title: t, Artist: a, Platform: "Spotify", OriginalURL: spotifyURL}
+			}
+		}
+		if strings.Contains(title, " - ") {
+			parts := strings.SplitN(title, " - ", 2)
+			t, a := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			if t != "" && a != "" {
+				return &SongInfo{Title: t, Artist: a, Platform: "Spotify", OriginalURL: spotifyURL}
+			}
 		}
 	}
-	if description != "" {
-		parts := strings.Split(description, " · ")
-		if len(parts) >= 2 {
-			return &SongInfo{Title: strings.TrimSpace(parts[0]), Artist: strings.TrimSpace(parts[1]), Platform: "Spotify", OriginalURL: spotifyURL}
+
+	// 3) DO NOT derive a full (title, artist) pair from description. It is usually "Artist · Album".
+	//    But we can still salvage the artist from its first token when we have nothing else.
+	if ogDesc != "" {
+		parts := reMidDotSep.Split(strings.ReplaceAll(ogDesc, "\u00A0", " "), -1)
+		if len(parts) >= 1 {
+			artist := strings.TrimSpace(parts[0]) // first token is typically the artist
+			if artist != "" {
+				return &SongInfo{Title: "", Artist: artist, Platform: "Spotify", OriginalURL: spotifyURL}
+			}
 		}
 	}
-	return nil
+
+	// 4) Last resort: return empty placeholders with platform + URL
+	return &SongInfo{Title: "", Artist: "", Platform: "Spotify", OriginalURL: spotifyURL}
 }
 
 func (mb *MusicBot) youTubeOEmbedInfo(youtubeURL, platform string) *SongInfo {
