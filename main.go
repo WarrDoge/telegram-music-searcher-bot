@@ -79,6 +79,8 @@ var (
 	// support optional /intl-xx/ prefix that Spotify uses
 	reSpotifyTrack = regexp.MustCompile(`(?:^|/)(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]+)`) // path matcher
 	reSpotifyURI   = regexp.MustCompile(`spotify:track:([A-Za-z0-9]+)`)                   // embedded URIs in scripts
+	// NEW: detect Spotify album URLs so we can resolve them to a track
+	reSpotifyAlbum = regexp.MustCompile(`(?:^|/)(?:intl-[a-z]{2}/)?album/([A-Za-z0-9]+)`)
 
 	reParenBlock = regexp.MustCompile(`\s*[\(\[][^)\]]*[\)\]]`)
 	reFeat       = regexp.MustCompile(`(?i)\s*(feat\.?|featuring)\s+[-–—·,]*[^-–—·,]+`)
@@ -863,6 +865,46 @@ func resolveDDGLink(href string) string {
 	return u
 }
 
+// NEW: if DDG returns an album page, fetch it and try to extract a track
+func (mb *MusicBot) tryAlbumToTrack(albumURL string) string {
+	resp, err := mb.fetch(albumURL)
+	if err != nil {
+		return ""
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return ""
+	}
+	// 1) look for spotify:track:ID in scripts
+	if id := func() string {
+		var id string
+		doc.Find("script").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+			if m := reSpotifyURI.FindStringSubmatch(s.Text()); len(m) == 2 {
+				id = m[1]
+				return false
+			}
+			return true
+		})
+		return id
+	}(); id != "" {
+		return "https://open.spotify.com/track/" + id
+	}
+	// 2) anchors with /track/
+	track := ""
+	doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
+		if href, _ := a.Attr("href"); href != "" {
+			if u := canonicalSpotifyTrack(href); u != "" {
+				track = u
+				return false
+			}
+		}
+		return true
+	})
+	return track
+}
+
 func (mb *MusicBot) searchSpotify(info *SongInfo) string {
 	key := normalizeQuery(info.Artist, info.Title)
 	if v, ok := mb.queryCache.Get("sp:" + key); ok {
@@ -962,6 +1004,13 @@ func (mb *MusicBot) searchSpotifyViaDDG2(artist, title string) string {
 			found = track
 			return false
 		}
+		// NEW: if DDG gave us an album, try to resolve to its first track
+		if reSpotifyAlbum.MatchString(u) {
+			if track := mb.tryAlbumToTrack(u); track != "" {
+				found = track
+				return false
+			}
+		}
 		return true
 	})
 	if found != "" {
@@ -992,6 +1041,12 @@ func (mb *MusicBot) searchSpotifyViaDDG2(artist, title string) string {
 		if track := canonicalSpotifyTrack(u); track != "" {
 			found = track
 			return false
+		}
+		if reSpotifyAlbum.MatchString(u) {
+			if track := mb.tryAlbumToTrack(u); track != "" {
+				found = track
+				return false
+			}
 		}
 		return true
 	})
