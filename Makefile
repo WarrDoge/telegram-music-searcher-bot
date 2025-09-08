@@ -26,16 +26,16 @@ build:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP)
 
 deploy: build
-	ssh root@$(IP) "systemctl stop $(APP)"
+	ssh root@$(IP) "systemctl stop $(APP)" || true
 
-	@sed "s/CHANGE_ME_1/$(APP)/g; s/CHANGE_ME_2/$(TOKEN)/g; w $(APP).service" $(APP).service.tpl >/dev/null
+	@sed "s/CHANGE_ME_1/$(APP)/g; s/CHANGE_ME_2/$(TOKEN)/g; w $(APP).service" service.tpl >/dev/null
 
 	scp ./$(APP) root@$(IP):/root/
 	scp ./$(APP).service root@$(IP):/etc/systemd/system/
 
 	ssh root@$(IP) "chmod +x /root/$(APP)"
 	ssh root@$(IP) "systemctl enable $(APP)"
-	ssh root@$(IP) "systemctl start $(APP)"
+	ssh root@$(IP) "systemctl restart $(APP)"
 
 clean:
 	rm ./$(APP) ./$(APP).service
