@@ -1,2 +1,5 @@
 *.service
-music-searcher
+**/tune-bridge-bot
+.env
+.envrc
+coverage.out

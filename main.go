@@ -19,16 +19,31 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/gocolly/colly/v2"
+	"github.com/sony/gobreaker"
+	"github.com/texttheater/golang-levenshtein/levenshtein"
+	"go.uber.org/zap"
 )
 
 // ---------------------------
-// Config & Models
+// Configuration & Types
 // ---------------------------
 
 type Config struct {
-	TelegramToken      string
-	Debug              bool
-	SpotifyDDGFallback bool // optional, default false (we will still fall back to DDG if primary fails)
+	TelegramToken          string
+	Debug                  bool
+	MaxConcurrentFetches   int
+	MaxConcurrentMessages  int
+	RequestTimeout         time.Duration
+	RetryAttempts          int
+	RetryMinDelay          time.Duration
+	RetryMaxDelay          time.Duration
+	CacheTTL               time.Duration
+	NegativeCacheTTL       time.Duration // Cache failed searches separately
+	FuzzyMatchThreshold    float64       // Levenshtein distance threshold (0-1)
+	CircuitBreakerMaxFails int           // Open circuit after N failures
+	CircuitBreakerTimeout  time.Duration // Circuit breaker timeout
+	TextMirrorURL          string        // Text mirror service (r.jina.ai)
 }
 
 type SongInfo struct {
@@ -49,10 +64,22 @@ type MusicBot struct {
 	config      *Config
 	telegramBot *tgbotapi.BotAPI
 	httpClient  *http.Client
+	collector   *colly.Collector
+	logger      *zap.Logger
 
-	// caches
-	queryCache *simpleCache // normalized query -> platform URL (only successful WATCH/TRACK/SONG urls, never search pages)
-	urlCache   *simpleCache // original URL -> JSON-encoded SongInfo
+	// Caches
+	queryCache    *SimpleCache
+	urlCache      *SimpleCache
+	negativeCache *SimpleCache // Cache for failed searches
+
+	// Circuit Breakers per service
+	spotifyBreaker    *gobreaker.CircuitBreaker
+	youtubeBreaker    *gobreaker.CircuitBreaker
+	appleMusicBreaker *gobreaker.CircuitBreaker
+
+	// Semaphores
+	fetchSem *Semaphore
+	msgSem   *Semaphore
 }
 
 type OEmbedResponse struct {
@@ -61,73 +88,215 @@ type OEmbedResponse struct {
 	AuthorName  string `json:"author_name"`
 }
 
-// --- Extra cleanup helpers ---
-// NB: Go's RE2 doesn't support \u escapes inside regex literals, so we normalize NBSP in code,
-// and make regexes use ordinary \s instead of trying to match NBSP directly.
-var reAppleMusicSuffix = regexp.MustCompile(`(?i)\s+(?:on|в|у|na|en|sur|su|auf|no|em|di|de|a)\s+apple\s*music`)
-var rePlatformNames = regexp.MustCompile(`(?i)\b(?:apple\s*music|spotify|youtube(?:\s*music)?)\b`)
-var fancyQuotes = strings.NewReplacer("«", "", "»", "", "“", "", "”", "", "„", "", "‘", "", "’", "")
+type YouTubeCandidate struct {
+	ID      string
+	Title   string
+	Channel string
+}
 
 // ---------------------------
-// Globals & Regex
+// Patterns & Constants
 // ---------------------------
 
 var (
-	fetchSem = make(chan struct{}, 8)  // cap parallel HTTP fetches
-	msgSem   = make(chan struct{}, 32) // cap parallel message handlers
+	USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-	reFirstURL = regexp.MustCompile(`https?://[^\s]+`)
-	// support optional /intl-xx/ prefix that Spotify uses
-	reSpotifyTrack = regexp.MustCompile(`(?:^|/)(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]+)`) // path matcher
-	reSpotifyURI   = regexp.MustCompile(`spotify:track:([A-Za-z0-9]+)`)                   // embedded URIs in scripts
-	// NEW: detect Spotify album URLs so we can resolve them to a track
+	// URL and parsing patterns
+	reFirstURL     = regexp.MustCompile(`https?://[^\s]+`)
+	reSpotifyTrack = regexp.MustCompile(`(?:^|/)(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]+)`)
 	reSpotifyAlbum = regexp.MustCompile(`(?:^|/)(?:intl-[a-z]{2}/)?album/([A-Za-z0-9]+)`)
-	reParenBlock   = regexp.MustCompile(`\s*[\(\[][^\)\]]*[\)\]]`)
-	reFeat         = regexp.MustCompile(`(?i)\s*(feat\.?|featuring)\s+[-–—·,]*[^-–—·,]+`)
-	// NEW: robust splitter for Spotify description separators
-	reMidDotSep = regexp.MustCompile(`\s*[·•]\s*`)
-	// NEW: dash variants used in og:title like "Title — Artist"
-	reDash = regexp.MustCompile(`\s*[-–—]\s*`)
+	reSpotifyURI   = regexp.MustCompile(`spotify:track:([A-Za-z0-9]+)`)
+
+	// Cleaning patterns
+	reParenBlock       = regexp.MustCompile(`\s*[\(\[][^\)\]]*[\)\]]`)
+	reFeat             = regexp.MustCompile(`(?i)\s*(feat\.?|featuring)\s+[-–—·,]*[^-–—·,]+`)
+	reMidDotSep        = regexp.MustCompile(`\s*[·•]\s*`)
+	reDash             = regexp.MustCompile(`\s*[-–—]\s*`)
+	reAppleMusicSuffix = regexp.MustCompile(`(?i)\s+(?:on|в|у|na|en|sur|su|auf|no|em|di|de|a)\s+apple\s*music`)
+	rePlatformNames    = regexp.MustCompile(`(?i)\b(?:apple\s*music|spotify|youtube(?:\s*music)?)\b`)
+
+	// YouTube artist cleaning
+	reVEVO      = regexp.MustCompile(`(?i)VEVO$`)
+	reOfficial  = regexp.MustCompile(`(?i)Official$`)
+	reCamelCase = regexp.MustCompile(`([a-z])([A-Z])`)
+
+	// Spotify embed extraction
+	reNextData = regexp.MustCompile(`<script id="__NEXT_DATA__" type="application/json">(.+?)</script>`)
+
+	fancyQuotes = map[string]string{
+		"\u00AB": "", // «
+		"\u00BB": "", // »
+		"\u201C": "", // "
+		"\u201D": "", // "
+		"\u201E": "", // „
+		"\u2019": "", // '
+		"\u2018": "", // '
+	}
 )
 
-// seed RNG for backoff jitter
-func init() { rand.Seed(time.Now().UnixNano()) }
-
 // ---------------------------
-// HTTP transport
+// Utility Classes
 // ---------------------------
 
-var defaultTransport = &http.Transport{
-	Proxy:                 http.ProxyFromEnvironment,
-	MaxIdleConns:          100,
-	MaxIdleConnsPerHost:   10,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ExpectContinueTimeout: 1 * time.Second,
-	ForceAttemptHTTP2:     true,
+type CacheEntry struct {
+	Value     string
+	ExpiresAt time.Time
+}
+
+type SimpleCache struct {
+	mu    sync.RWMutex
+	cache map[string]CacheEntry
+}
+
+func NewSimpleCache() *SimpleCache {
+	return &SimpleCache{
+		cache: make(map[string]CacheEntry),
+	}
+}
+
+func (c *SimpleCache) Get(key string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, ok := c.cache[key]
+	if !ok || time.Now().After(entry.ExpiresAt) {
+		return "", false
+	}
+	return entry.Value, true
+}
+
+func (c *SimpleCache) Set(key, value string, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.cache[key] = CacheEntry{
+		Value:     value,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+}
+
+type Semaphore struct {
+	sem chan struct{}
+}
+
+func NewSemaphore(max int) *Semaphore {
+	return &Semaphore{
+		sem: make(chan struct{}, max),
+	}
+}
+
+func (s *Semaphore) Acquire() {
+	s.sem <- struct{}{}
+}
+
+func (s *Semaphore) Release() {
+	<-s.sem
+}
+
+func (s *Semaphore) Run(fn func()) {
+	s.Acquire()
+	defer s.Release()
+	fn()
 }
 
 // ---------------------------
 // Bot Lifecycle
 // ---------------------------
 
+// NewLogger creates a new zap logger
+func NewLogger(debug bool) (*zap.Logger, error) {
+	if debug {
+		return zap.NewDevelopment()
+	}
+	return zap.NewProduction()
+}
+
+// createCircuitBreaker creates a circuit breaker with the given name
+func createCircuitBreaker(name string, config *Config, logger *zap.Logger) *gobreaker.CircuitBreaker {
+	settings := gobreaker.Settings{
+		Name:        name,
+		MaxRequests: uint32(config.CircuitBreakerMaxFails),
+		Interval:    time.Minute,
+		Timeout:     config.CircuitBreakerTimeout,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 3 && failureRatio >= 0.6
+		},
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			if logger != nil {
+				logger.Info("Circuit breaker state changed",
+					zap.String("service", name),
+					zap.String("from", from.String()),
+					zap.String("to", to.String()))
+			}
+		},
+	}
+	return gobreaker.NewCircuitBreaker(settings)
+}
+
+// createCollyCollector creates a Colly collector for web scraping
+func createCollyCollector(config *Config) *colly.Collector {
+	collector := colly.NewCollector(
+		colly.UserAgent(USER_AGENT),
+		colly.Async(true),
+	)
+
+	collector.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: config.MaxConcurrentFetches,
+		RandomDelay: 150 * time.Millisecond,
+	})
+
+	collector.SetRequestTimeout(config.RequestTimeout)
+	return collector
+}
+
 func NewMusicBot(config *Config) (*MusicBot, error) {
+	// Initialize logger
+	logger, err := NewLogger(config.Debug)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create logger: %w", err)
+	}
+
 	bot, err := tgbotapi.NewBotAPI(config.TelegramToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
 	}
 	bot.Debug = config.Debug
-	log.Printf("Authorized on account %s (debug=%v)", bot.Self.UserName, bot.Debug)
+	logger.Info("Authorized as Telegram bot",
+		zap.String("username", bot.Self.UserName),
+		zap.Bool("debug", bot.Debug))
 
-	// Use a client-level timeout so callers can safely read resp.Body.
-	client := &http.Client{Transport: defaultTransport, Timeout: 12 * time.Second}
+	httpClient := &http.Client{
+		Timeout: config.RequestTimeout,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+	}
+
+	// Setup Colly collector
+	collector := createCollyCollector(config)
 
 	return &MusicBot{
-		config:      config,
-		telegramBot: bot,
-		httpClient:  client,
-		queryCache:  newSimpleCache(),
-		urlCache:    newSimpleCache(),
+		config:            config,
+		telegramBot:       bot,
+		httpClient:        httpClient,
+		collector:         collector,
+		logger:            logger,
+		queryCache:        NewSimpleCache(),
+		urlCache:          NewSimpleCache(),
+		negativeCache:     NewSimpleCache(),
+		spotifyBreaker:    createCircuitBreaker("Spotify", config, logger),
+		youtubeBreaker:    createCircuitBreaker("YouTube", config, logger),
+		appleMusicBreaker: createCircuitBreaker("AppleMusic", config, logger),
+		fetchSem:          NewSemaphore(config.MaxConcurrentFetches),
+		msgSem:            NewSemaphore(config.MaxConcurrentMessages),
 	}, nil
 }
 
@@ -136,10 +305,13 @@ func (mb *MusicBot) Run(ctx context.Context) {
 	u.Timeout = 60
 	updates := mb.telegramBot.GetUpdatesChan(u)
 
+	log.Println("🎵 Music Link Converter Bot is running…")
+	log.Println("📡 No API keys required - using web scraping!")
+
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Shutting down bot loop…")
+			log.Println("👋 Shutting down bot loop gracefully…")
 			return
 		case update, ok := <-updates:
 			if !ok {
@@ -148,15 +320,15 @@ func (mb *MusicBot) Run(ctx context.Context) {
 			if update.Message == nil {
 				continue
 			}
-			msgSem <- struct{}{}
 			go func(m *tgbotapi.Message) {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("panic in handleMessage: %v", r)
-					}
-					<-msgSem
-				}()
-				mb.handleMessage(m)
+				mb.msgSem.Run(func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("⚠️  Panic in handleMessage: %v", r)
+						}
+					}()
+					mb.handleMessage(m)
+				})
 			}(update.Message)
 		}
 	}
@@ -189,14 +361,14 @@ func (mb *MusicBot) handleMessage(m *tgbotapi.Message) {
 
 	artist := info.Artist
 	if strings.TrimSpace(artist) == "" {
-		artist = "Unknown Artist" // placeholder ONLY for display; we do not store this sentinel
+		artist = "Unknown Artist"
 	}
 
 	mb.sendReply(chatID, replyTo, md2(fmt.Sprintf("🔍 Found: *%s* by *%s*\n\nSearching other platforms…", info.Title, artist)))
 
 	links := mb.findOnAllPlatforms(info)
 
-	// Enrich missing artist using other platform results (UX polish).
+	// Enrich missing artist using other platform results
 	if strings.TrimSpace(info.Artist) == "" {
 		if links.AppleMusic != "" {
 			if si := mb.getAppleMusicInfo(links.AppleMusic); si != nil && strings.TrimSpace(si.Artist) != "" {
@@ -219,7 +391,7 @@ func (mb *MusicBot) handleMessage(m *tgbotapi.Message) {
 }
 
 // ---------------------------
-// Telegram helpers
+// Telegram Helpers
 // ---------------------------
 
 func (mb *MusicBot) sendReply(chatID int64, replyToID int, text string) {
@@ -230,7 +402,9 @@ func (mb *MusicBot) sendReply(chatID int64, replyToID int, text string) {
 		msg.DisableWebPagePreview = true
 
 		if _, err := mb.telegramBot.Send(msg); err != nil {
-			log.Printf("Error sending message with MarkdownV2 (retrying plain): %v | textLen=%d", err, len(chunk))
+			if mb.config.Debug {
+				log.Printf("⚠️  Error sending message with MarkdownV2: %v", err)
+			}
 			msg.ParseMode = ""
 			_, _ = mb.telegramBot.Send(msg)
 		}
@@ -247,9 +421,8 @@ func chunkText(s string, max int) []string {
 			out = append(out, s)
 			break
 		}
-		// try split on last newline within window
 		cut := strings.LastIndex(s[:max], "\n")
-		if cut < max/2 { // too early or no newline; hard split
+		if cut < max/2 {
 			cut = max
 		}
 		out = append(out, s[:cut])
@@ -297,32 +470,26 @@ func (mb *MusicBot) sendLinks(chatID int64, replyToID int, info *SongInfo, links
 	}
 
 	if _, err := mb.telegramBot.Send(msg); err != nil {
-		log.Printf("Error sending links: %v", err)
+		log.Printf("⚠️  Error sending links: %v", err)
 	}
 }
 
-func md2(s string) string { return tgbotapi.EscapeText(tgbotapi.ModeMarkdownV2, s) }
-
-// ---------------------------
-// URL & HTTP helpers
-// ---------------------------
-
-func firstURL(s string) string {
-	m := reFirstURL.FindString(s)
-	return strings.TrimRight(m, ".,);!?]}>\"'")
+func md2(s string) string {
+	return tgbotapi.EscapeText(tgbotapi.ModeMarkdownV2, s)
 }
 
-func (mb *MusicBot) fetchCtx(ctx context.Context, target string) (*http.Response, error) {
-	fetchSem <- struct{}{}
-	defer func() { <-fetchSem }()
+// ---------------------------
+// HTTP Helpers
+// ---------------------------
 
+func (mb *MusicBot) fetch(target string) (*http.Response, error) {
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	for attempt := 0; attempt < mb.config.RetryAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodGet, target, nil)
 		if err != nil {
 			return nil, fmt.Errorf("new request: %w", err)
 		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MusicLinkBot/1.0)")
+		req.Header.Set("User-Agent", USER_AGENT)
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9,uk;q=0.8,ru;q=0.7")
 		req.Header.Set("Accept", "text/html,application/json;q=0.9,*/*;q=0.8")
 
@@ -340,1228 +507,25 @@ func (mb *MusicBot) fetchCtx(ctx context.Context, target string) (*http.Response
 			resp.Body.Close()
 			return nil, fmt.Errorf("status %d for %s", resp.StatusCode, target)
 		}
-		time.Sleep(time.Duration(150+rand.Intn(200)) * time.Millisecond)
+
+		if attempt < mb.config.RetryAttempts-1 {
+			delay := mb.config.RetryMinDelay + time.Duration(rand.Intn(int(mb.config.RetryMaxDelay-mb.config.RetryMinDelay)))
+			if mb.config.Debug {
+				log.Printf("🔄 Retry %d/%d for %s after %v", attempt+1, mb.config.RetryAttempts, target, delay)
+			}
+			time.Sleep(delay)
+		}
 	}
 	return nil, lastErr
 }
 
-func (mb *MusicBot) fetch(target string) (*http.Response, error) {
-	// No per-request cancel here; rely on http.Client.Timeout above.
-	return mb.fetchCtx(context.Background(), target)
-}
-
-func joinApple(base, href string) string {
-	if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
-		return href
-	}
-	u, err := url.Parse(base)
-	if err != nil {
-		return "https://music.apple.com" + href
-	}
-	return u.Scheme + "://" + u.Host + href
-}
-
-func cleanPlatformNoise(s string) string {
-	// normalize spaces (incl. NBSP), drop localized "… Apple Music" suffixes,
-	// remove platform brand words and fancy quotes.
-	s = strings.ReplaceAll(s, "\u00A0", " ")
-	s = reAppleMusicSuffix.ReplaceAllString(s, "")
-	s = rePlatformNames.ReplaceAllString(s, "")
-	s = fancyQuotes.Replace(s)
-	return strings.TrimSpace(s)
-}
-
-func cleanTitleArtist(t, a string) (string, string) {
-	t = cleanPlatformNoise(t)
-	a = cleanPlatformNoise(a)
-	return t, a
-}
-
-// Heuristics: detect album-like strings and artist lists to avoid swapping errors
-func isAlbumish(s string) bool {
-	ls := strings.ToLower(strings.TrimSpace(s))
-	if ls == "" {
-		return false
-	}
-	hints := []string{"original soundtrack", "soundtrack", "ost", "score", "music from", "season ", " vol.", " volume ", ":"}
-	for _, h := range hints {
-		if strings.Contains(ls, h) {
-			return true
-		}
-	}
-	return false
-}
-
-func looksLikeArtistList(s string) bool {
-	ls := strings.ToLower(strings.TrimSpace(s))
-	if ls == "" {
-		return false
-	}
-	if strings.Contains(ls, ",") || strings.Contains(ls, " & ") || strings.Contains(ls, " and ") || strings.Contains(ls, " feat") || strings.Contains(ls, " featuring ") {
-		if !strings.Contains(ls, ":") && !strings.Contains(ls, "-") {
-			return true
-		}
-	}
-	return false
+func firstURL(s string) string {
+	m := reFirstURL.FindString(s)
+	return strings.TrimRight(m, ".,);!?]}>\"'")
 }
 
 // ---------------------------
-// Normalization helpers
-// ---------------------------
-
-func normalizeQuery(artist, title string) string {
-	clean := func(s string) string {
-		s = reParenBlock.ReplaceAllString(s, "")
-		s = reFeat.ReplaceAllString(s, "")
-		repls := []string{
-			" - single", "", " - ep", "", " - album", "",
-			" – single", "", " – ep", "",
-			" remastered", "", " - remaster", "", " remaster", "",
-			" - radio edit", "", " radio edit", "",
-			" official video", "", " lyric video", "", " lyrics", "",
-		}
-		ls := strings.ToLower(s)
-		ls = strings.ReplaceAll(ls, "\u00A0", " ")
-		// strip platform noise early (handles “в/у/on Apple Music”, etc.)
-		ls = reAppleMusicSuffix.ReplaceAllString(ls, "")
-		ls = rePlatformNames.ReplaceAllString(ls, "")
-		ls = fancyQuotes.Replace(ls)
-		for i := 0; i < len(repls); i += 2 {
-			ls = strings.ReplaceAll(ls, repls[i], repls[i+1])
-		}
-		ls = strings.Join(strings.Fields(ls), " ")
-		return ls
-	}
-	a := clean(artist)
-	t := clean(title)
-	return strings.TrimSpace(a + " " + t)
-}
-
-func normalizeForMatch(s string) string {
-	s = strings.ToLower(s)
-	s = reParenBlock.ReplaceAllString(s, "")
-	s = strings.NewReplacer(
-		"-", " ", "—", " ", "–", " ", "·", " ", ".", " ", ",", " ",
-		"!", " ", "?", " ", "/", " ", "&", " and ", "'", " ", "’", " ",
-	).Replace(s)
-	s = fancyQuotes.Replace(s)
-	s = rePlatformNames.ReplaceAllString(s, "")
-	s = strings.Join(strings.Fields(s), " ")
-	return s
-}
-
-// ---------------------------
-// Platform parsers
-// ---------------------------
-
-// splitFromOgTitle tries to robustly extract (title, artist) from Spotify og:title,
-// using og:description as a hint (its first token is almost always the artist).
-func splitFromOgTitle(ogTitle, ogDesc string) (title, artist string) {
-	if ogTitle == "" {
-		return "", ""
-	}
-	t := strings.TrimSpace(strings.TrimSuffix(ogTitle, " | Spotify"))
-	t = strings.ReplaceAll(t, "\u00A0", " ")
-
-	// Case 1: "... by ..." (localized pages often still use " by ")
-	if idx := strings.Index(strings.ToLower(t), " by "); idx != -1 {
-		return strings.TrimSpace(t[:idx]), strings.TrimSpace(t[idx+4:])
-	}
-
-	// Case 2: dash variants "Left — Right" which could be "Title — Artist" or "Artist — Title"
-	parts := reDash.Split(t, 2)
-	if len(parts) != 2 {
-		return "", ""
-	}
-	left, right := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-
-	// Derive a hint for artist from description ("Artist · Album")
-	var hintArtist string
-	if ogDesc != "" {
-		ds := reMidDotSep.Split(strings.ReplaceAll(ogDesc, "\u00A0", " "), -1)
-		if len(ds) >= 1 {
-			hintArtist = strings.TrimSpace(ds[0])
-		}
-	}
-
-	ln := normalizeForMatch(left)
-	rn := normalizeForMatch(right)
-	an := normalizeForMatch(hintArtist)
-
-	// If one side equals hint artist, we know the orientation
-	if an != "" {
-		if ln == an {
-			// "Artist — Title"
-			return right, left
-		}
-		if rn == an {
-			// "Title — Artist"
-			return left, right
-		}
-	}
-
-	// Heuristic: channels/artists look like lists more than titles do
-	if looksLikeArtistList(right) {
-		return left, right
-	}
-	if looksLikeArtistList(left) {
-		return right, left
-	}
-
-	// Default assumption: "Title — Artist"
-	return left, right
-}
-
-func (mb *MusicBot) getSpotifyInfo(spotifyURL string) *SongInfo {
-	if v, ok := mb.urlCache.Get("info:" + spotifyURL); ok {
-		var si SongInfo
-		if json.Unmarshal([]byte(v), &si) == nil {
-			return &si
-		}
-	}
-	if !reSpotifyTrack.MatchString(spotifyURL) {
-		return nil
-	}
-	oembedURL := fmt.Sprintf("https://open.spotify.com/oembed?url=%s", url.QueryEscape(spotifyURL))
-	resp, err := mb.fetch(oembedURL)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("Spotify OEmbed error: %v", err)
-		}
-		return mb.fallbackSpotifyScrape(spotifyURL)
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	var oembed OEmbedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&oembed); err != nil {
-		if mb.config.Debug {
-			log.Printf("Spotify OEmbed decode error: %v", err)
-		}
-		return mb.fallbackSpotifyScrape(spotifyURL)
-	}
-
-	// Start with oEmbed fields
-	title := strings.TrimSpace(oembed.Title)
-	artist := strings.TrimSpace(oembed.AuthorName)
-
-	// Clean common suffixes
-	title = strings.TrimSuffix(title, " | Spotify")
-	title = strings.NewReplacer(" — ", " - ", " – ", " - ").Replace(title)
-
-	// Use description ONLY to fill missing fields. Don't overwrite good values.
-	if desc := strings.TrimSpace(oembed.Description); desc != "" && (strings.TrimSpace(title) == "" || strings.TrimSpace(artist) == "") {
-		parts := reMidDotSep.Split(strings.ReplaceAll(desc, "\u00A0", " "), -1)
-
-		// If artist is missing, try to pick the part that isn't the known title and isn't album-ish.
-		if strings.TrimSpace(artist) == "" && len(parts) >= 2 {
-			p0, p1 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-			switch {
-			case title != "" && strings.EqualFold(p0, title):
-				artist = p1
-			case title != "" && strings.EqualFold(p1, title):
-				artist = p0
-			case isAlbumish(p0) && !isAlbumish(p1):
-				artist = p1
-			case isAlbumish(p1) && !isAlbumish(p0):
-				artist = p0
-			default:
-				// default best guess: second token tends to be artist more often than album
-				artist = p1
-			}
-		}
-
-		// If title is missing, try to pick the part that isn't the known artist and isn't album-ish.
-		if strings.TrimSpace(title) == "" && len(parts) >= 2 {
-			p0, p1 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-			switch {
-			case artist != "" && strings.EqualFold(p0, artist):
-				title = p1
-			case artist != "" && strings.EqualFold(p1, artist):
-				title = p0
-			case !isAlbumish(p0) && isAlbumish(p1):
-				title = p0
-			case !isAlbumish(p1) && isAlbumish(p0):
-				title = p1
-			default:
-				// default best guess: first token is often the track title
-				title = p0
-			}
-		}
-	}
-
-	// If artist is still empty, try to infer from oEmbed title (case-insensitive " by ")
-	if strings.TrimSpace(artist) == "" {
-		if tl := strings.ToLower(title); strings.Contains(tl, " by ") {
-			if idx := strings.Index(tl, " by "); idx != -1 {
-				left := strings.TrimSpace(title[:idx])
-				right := strings.TrimSpace(title[idx+4:])
-				if left != "" && right != "" {
-					title, artist = left, right
-				}
-			}
-		} else if strings.Contains(title, " · ") {
-			p := strings.SplitN(title, " · ", 2)
-			title = strings.TrimSpace(p[0])
-			artist = strings.TrimSpace(p[1])
-		} else if strings.Contains(title, " - ") {
-			p := strings.SplitN(title, " - ", 2)
-			left, right := strings.TrimSpace(p[0]), strings.TrimSpace(p[1])
-			title, artist = left, right
-		}
-	}
-
-	// If parsing looks wrong (album-ish), artist empty, or title==artist — scrape HTML.
-	if strings.TrimSpace(artist) == "" || isAlbumish(artist) || (looksLikeArtistList(title) && !looksLikeArtistList(artist)) || strings.EqualFold(title, artist) {
-		if si := mb.fallbackSpotifyScrape(spotifyURL); si != nil {
-			if si.Title != "" && si.Artist != "" {
-				if b, err := json.Marshal(si); err == nil {
-					mb.urlCache.Set("info:"+spotifyURL, string(b), 24*time.Hour)
-				}
-				return si
-			}
-			if strings.TrimSpace(artist) == "" && strings.TrimSpace(si.Artist) != "" {
-				artist = si.Artist
-			}
-			if strings.TrimSpace(title) == "" && strings.TrimSpace(si.Title) != "" {
-				title = si.Title
-			}
-		}
-	}
-
-	// Final fallback if title missing
-	if strings.TrimSpace(title) == "" {
-		if si := mb.fallbackSpotifyScrape(spotifyURL); si != nil {
-			if b, err := json.Marshal(si); err == nil {
-				mb.urlCache.Set("info:"+spotifyURL, string(b), 24*time.Hour)
-			}
-			return si
-		}
-	}
-
-	// Extra sanity: if we still landed on album in the artist field or got a self-equal, try scrape once more
-	if isAlbumish(artist) || strings.EqualFold(title, artist) {
-		if si := mb.fallbackSpotifyScrape(spotifyURL); si != nil && si.Title != "" && si.Artist != "" {
-			title, artist = si.Title, si.Artist
-		}
-	}
-
-	si := &SongInfo{Title: title, Artist: artist, Platform: "Spotify", OriginalURL: spotifyURL}
-	if b, err := json.Marshal(si); err == nil {
-		mb.urlCache.Set("info:"+spotifyURL, string(b), 24*time.Hour)
-	}
-	return si
-}
-
-func (mb *MusicBot) fallbackSpotifyScrape(spotifyURL string) *SongInfo {
-	resp, err := mb.fetch(spotifyURL)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("Spotify page fetch error: %v", err)
-		}
-		return nil
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("Spotify HTML parse error: %v", err)
-		}
-		return nil
-	}
-	ogTitle := doc.Find("meta[property='og:title']").AttrOr("content", "")
-	ogDesc := doc.Find("meta[property='og:description']").AttrOr("content", "")
-
-	// 1) Try robust split from og:title, using og:description as hint
-	if ti, ar := splitFromOgTitle(ogTitle, ogDesc); ti != "" && ar != "" {
-		return &SongInfo{Title: ti, Artist: ar, Platform: "Spotify", OriginalURL: spotifyURL}
-	}
-
-	// 2) Fallback to earlier og:title heuristics
-	if ogTitle != "" {
-		title := strings.TrimSuffix(ogTitle, " | Spotify")
-		title = strings.NewReplacer(
-			" — ", " - ",
-			" – ", " - ",
-			" - song and lyrics by ", " - ",
-			" - song by ", " - ",
-		).Replace(title)
-		if idx := strings.Index(strings.ToLower(title), " by "); idx != -1 {
-			t := strings.TrimSpace(title[:idx])
-			a := strings.TrimSpace(title[idx+4:])
-			if t != "" && a != "" {
-				return &SongInfo{Title: t, Artist: a, Platform: "Spotify", OriginalURL: spotifyURL}
-			}
-		}
-		if strings.Contains(title, " - ") {
-			parts := strings.SplitN(title, " - ", 2)
-			t, a := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-			if t != "" && a != "" {
-				return &SongInfo{Title: t, Artist: a, Platform: "Spotify", OriginalURL: spotifyURL}
-			}
-		}
-	}
-
-	// 3) DO NOT derive a full (title, artist) pair from description. It is usually "Artist · Album".
-	//    But we can still salvage the artist from its first token when we have nothing else.
-	if ogDesc != "" {
-		parts := reMidDotSep.Split(strings.ReplaceAll(ogDesc, "\u00A0", " "), -1)
-		if len(parts) >= 1 {
-			artist := strings.TrimSpace(parts[0]) // first token is typically the artist
-			if artist != "" {
-				return &SongInfo{Title: "", Artist: artist, Platform: "Spotify", OriginalURL: spotifyURL}
-			}
-		}
-	}
-
-	// 4) Last resort: return empty placeholders with platform + URL
-	return &SongInfo{Title: "", Artist: "", Platform: "Spotify", OriginalURL: spotifyURL}
-}
-
-func (mb *MusicBot) youTubeOEmbedInfo(youtubeURL, platform string) *SongInfo {
-	o := "https://www.youtube.com/oembed?format=json&url=" + url.QueryEscape(youtubeURL)
-	resp, err := mb.fetch(o)
-	if err != nil {
-		return nil
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-	var r struct {
-		Title  string `json:"title"`
-		Author string `json:"author_name"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&r) == nil && r.Title != "" {
-		artist := strings.TrimSuffix(r.Author, " - Topic")
-		return &SongInfo{Title: strings.TrimSpace(r.Title), Artist: strings.TrimSpace(artist), Platform: platform, OriginalURL: youtubeURL}
-	}
-	return nil
-}
-
-func (mb *MusicBot) getYouTubeInfo(youtubeURL string, platform string) *SongInfo {
-	if v, ok := mb.urlCache.Get("info:" + youtubeURL); ok {
-		var si SongInfo
-		if json.Unmarshal([]byte(v), &si) == nil {
-			return &si
-		}
-	}
-	if s := mb.youTubeOEmbedInfo(youtubeURL, platform); s != nil {
-		if b, err := json.Marshal(s); err == nil {
-			mb.urlCache.Set("info:"+youtubeURL, string(b), 24*time.Hour)
-		}
-		return s
-	}
-
-	resp, err := mb.fetch(youtubeURL)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("YouTube fetch error: %v", err)
-		}
-		return nil
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("YouTube parse error: %v", err)
-		}
-		return nil
-	}
-
-	js := jsonObjectFromScriptContaining(doc, "ytInitialPlayerResponse")
-	if js != "" {
-		var pr struct {
-			VideoDetails struct {
-				Title  string `json:"title"`
-				Author string `json:"author"`
-			} `json:"videoDetails"`
-		}
-		if json.Unmarshal([]byte(js), &pr) == nil && pr.VideoDetails.Title != "" {
-			out := &SongInfo{
-				Title:       strings.TrimSpace(pr.VideoDetails.Title),
-				Artist:      strings.TrimSpace(strings.TrimSuffix(pr.VideoDetails.Author, " - Topic")),
-				Platform:    platform,
-				OriginalURL: youtubeURL,
-			}
-			if b, err := json.Marshal(out); err == nil {
-				mb.urlCache.Set("info:"+youtubeURL, string(b), 24*time.Hour)
-			}
-			return out
-		}
-	}
-
-	title := doc.Find("meta[property='og:title']").AttrOr("content", "")
-	videoDetails := doc.Find("meta[property='og:video:tag']").AttrOr("content", "")
-	title = strings.ReplaceAll(title, " - YouTube Music", "")
-	title = strings.ReplaceAll(title, " - YouTube", "")
-
-	if strings.Contains(title, " - ") {
-		parts := strings.SplitN(title, " - ", 2)
-		if len(parts) == 2 {
-			out := &SongInfo{Title: strings.TrimSpace(parts[1]), Artist: strings.TrimSpace(parts[0]), Platform: platform, OriginalURL: youtubeURL}
-			if b, err := json.Marshal(out); err == nil {
-				mb.urlCache.Set("info:"+youtubeURL, string(b), 24*time.Hour)
-			}
-			return out
-		}
-	} else if strings.Contains(title, " · ") {
-		parts := strings.SplitN(title, " · ", 2)
-		if len(parts) == 2 {
-			out := &SongInfo{Title: strings.TrimSpace(parts[0]), Artist: strings.TrimSpace(parts[1]), Platform: platform, OriginalURL: youtubeURL}
-			if b, err := json.Marshal(out); err == nil {
-				mb.urlCache.Set("info:"+youtubeURL, string(b), 24*time.Hour)
-			}
-			return out
-		}
-	} else if title != "" {
-		out := &SongInfo{Title: strings.TrimSpace(title), Artist: strings.TrimSpace(videoDetails), Platform: platform, OriginalURL: youtubeURL}
-		if b, err := json.Marshal(out); err == nil {
-			mb.urlCache.Set("info:"+youtubeURL, string(b), 24*time.Hour)
-		}
-		return out
-	}
-	return nil
-}
-
-func (mb *MusicBot) getAppleMusicInfo(appleURL string) *SongInfo {
-	if v, ok := mb.urlCache.Get("info:" + appleURL); ok {
-		var si SongInfo
-		if json.Unmarshal([]byte(v), &si) == nil {
-			return &si
-		}
-	}
-
-	resp, err := mb.fetch(appleURL)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("Apple fetch error: %v", err)
-		}
-		return nil
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("Apple parse error: %v", err)
-		}
-		return nil
-	}
-
-	title, artist := appleLD(doc)
-	if title == "" {
-		title = doc.Find("meta[property='og:title']").AttrOr("content", "")
-	}
-	if title != "" && artist == "" {
-		if strings.Contains(title, " by ") && strings.Contains(title, " on Apple Music") {
-			parts := strings.SplitN(title, " by ", 2)
-			title = strings.TrimSpace(parts[0])
-			artist = strings.TrimSuffix(strings.TrimSpace(parts[1]), " on Apple Music")
-		}
-		if artist == "" && strings.Contains(title, ",") && strings.Contains(title, " в Apple Music") {
-			parts := strings.SplitN(title, ",", 2)
-			title = strings.TrimSpace(parts[0])
-			artist = strings.TrimSuffix(strings.TrimSpace(parts[1]), " в Apple Music")
-		}
-	}
-
-	// Final cleanup in case JSON-LD/og:title is localized
-	title, artist = cleanTitleArtist(title, artist)
-
-	title = strings.ReplaceAll(title, " - Single", "")
-	title = strings.ReplaceAll(title, " - EP", "")
-	title = strings.ReplaceAll(title, " - Album", "")
-	title = strings.ReplaceAll(title, " on Apple Music", "")
-	title = strings.ReplaceAll(title, " в Apple Music", "")
-
-	if title == "" {
-		return nil
-	}
-
-	// Fallback: if artist is still empty and og:title looked like "Title, Artist"
-	if strings.TrimSpace(artist) == "" && strings.Contains(title, ",") {
-		parts := strings.Split(title, ",")
-		if len(parts) >= 2 {
-			title = strings.TrimSpace(strings.Join(parts[:len(parts)-1], ","))
-			artist = strings.TrimSpace(parts[len(parts)-1])
-		}
-	}
-
-	out := &SongInfo{Title: strings.TrimSpace(title), Artist: strings.TrimSpace(artist), Platform: "Apple Music", OriginalURL: appleURL}
-	if b, err := json.Marshal(out); err == nil {
-		mb.urlCache.Set("info:"+appleURL, string(b), 24*time.Hour)
-	}
-	return out
-}
-
-func appleLD(doc *goquery.Document) (title, artist string) {
-	doc.Find("script[type='application/ld+json']").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-		raw := strings.TrimSpace(s.Text())
-		if raw == "" {
-			return true
-		}
-		var any interface{}
-		if json.Unmarshal([]byte(raw), &any) != nil {
-			return true
-		}
-		var objects []map[string]interface{}
-		switch v := any.(type) {
-		case map[string]interface{}:
-			objects = append(objects, v)
-		case []interface{}:
-			for _, it := range v {
-				if m, ok := it.(map[string]interface{}); ok {
-					objects = append(objects, m)
-				}
-			}
-		default:
-			return true
-		}
-		for _, obj := range objects {
-			t, _ := obj["@type"].(string)
-			if t == "MusicRecording" || t == "MusicAlbum" || t == "CreativeWork" {
-				if n, ok := obj["name"].(string); ok && n != "" {
-					title = n
-				}
-				switch by := obj["byArtist"].(type) {
-				case map[string]interface{}:
-					if n, ok := by["name"].(string); ok {
-						artist = n
-					}
-				case []interface{}:
-					for _, it := range by {
-						if m, ok := it.(map[string]interface{}); ok {
-							if n, ok := m["name"].(string); ok && n != "" {
-								artist = n
-								break
-							}
-						}
-					}
-				}
-				if title != "" {
-					return false
-				}
-			}
-		}
-		return true
-	})
-	return
-}
-
-// ---------------------------
-// Search
-// ---------------------------
-
-func (mb *MusicBot) findOnAllPlatforms(info *SongInfo) *MusicLinks {
-	links := &MusicLinks{}
-	set := func(p *string, v string) {
-		if v != "" {
-			*p = v
-		}
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(3)
-
-	go func() {
-		defer wg.Done()
-		if info.Platform == "Spotify" {
-			set(&links.Spotify, info.OriginalURL)
-		} else {
-			set(&links.Spotify, mb.searchSpotify(info))
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if info.Platform == "YouTube Music" {
-			set(&links.YouTubeMusic, info.OriginalURL)
-		} else if info.Platform == "YouTube" {
-			if u := toYouTubeMusicURL(info.OriginalURL); u != "" {
-				set(&links.YouTubeMusic, u)
-			} else {
-				set(&links.YouTubeMusic, mb.searchYouTube(info))
-			}
-		} else {
-			set(&links.YouTubeMusic, mb.searchYouTube(info))
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if info.Platform == "Apple Music" {
-			set(&links.AppleMusic, info.OriginalURL)
-		} else {
-			set(&links.AppleMusic, mb.searchAppleMusic(info))
-		}
-	}()
-
-	wg.Wait()
-	return links
-}
-
-func (mb *MusicBot) searchYouTube(info *SongInfo) string {
-	key := normalizeQuery(info.Artist, info.Title)
-	if v, ok := mb.queryCache.Get("yt:" + key); ok {
-		return v
-	}
-
-	query := key
-
-	// 1) Try YouTube Music search (preferred)
-	if u := mb.searchYouTubeViaPage("https://music.youtube.com/search?q="+url.QueryEscape(query), info); u != "" {
-		mb.queryCache.Set("yt:"+key, u, 24*time.Hour)
-		return u
-	}
-
-	// 2) Fallback: classic YouTube search
-	if u := mb.searchYouTubeViaPage("https://www.youtube.com/results?search_query="+url.QueryEscape(query), info); u != "" {
-		// prefer a music.youtube.com watch url for consistency
-		if vid := youtubeVideoIDFromURL(u); vid != "" {
-			u = "https://music.youtube.com/watch?v=" + vid
-		}
-		mb.queryCache.Set("yt:"+key, u, 24*time.Hour)
-		return u
-	}
-
-	// 3) Last resort: return YT Music search page (DO NOT cache failures)
-	return "https://music.youtube.com/search?q=" + url.QueryEscape(query)
-}
-
-func (mb *MusicBot) searchYouTubeViaPage(searchURL string, info *SongInfo) string {
-	resp, err := mb.fetch(searchURL)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("YouTube search fetch failed: %v", err)
-		}
-		return ""
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		if mb.config.Debug {
-			log.Printf("YouTube search parse failed: %v", err)
-		}
-		return ""
-	}
-
-	jsonStr := jsonObjectFromScriptContaining(doc, "ytInitialData")
-	if jsonStr == "" {
-		return ""
-	}
-	var any map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &any); err != nil {
-		if mb.config.Debug {
-			log.Printf("ytInitialData unmarshal failed: %v", err)
-		}
-		return ""
-	}
-	if vid := findPreferredYouTubeVideoID(any, info.Artist, info.Title); vid != "" {
-		return "https://music.youtube.com/watch?v=" + vid
-	}
-	if vid := extractFirstYouTubeVideoID(any); vid != "" {
-		return "https://music.youtube.com/watch?v=" + vid
-	}
-	return ""
-}
-
-// ---------------------------
-// Spotify search (now with robust DDG fallback returning a direct /track URL)
-// ---------------------------
-
-// canonicalize any Spotify URL that contains a track id (incl. intl-xx prefix, query, etc.)
-func canonicalSpotifyTrack(u string) string {
-	if m := reSpotifyTrack.FindStringSubmatch(u); len(m) == 2 {
-		return "https://open.spotify.com/track/" + m[1]
-	}
-	return ""
-}
-
-// unwrap DuckDuckGo redirect /l/?uddg=... and normalize
-func resolveDDGLink(href string) string {
-	if href == "" {
-		return ""
-	}
-	u := href
-	if strings.HasPrefix(u, "//") {
-		u = "https:" + u
-	} else if strings.HasPrefix(u, "/") && !strings.HasPrefix(u, "/track/") {
-		u = "https://duckduckgo.com" + u
-	}
-	if ru, err := url.Parse(u); err == nil {
-		if strings.Contains(ru.Host, "duckduckgo.com") && strings.HasPrefix(ru.Path, "/l/") {
-			if v := ru.Query().Get("uddg"); v != "" {
-				if dec, err := url.QueryUnescape(v); err == nil {
-					return dec
-				}
-				return v
-			}
-		}
-	}
-	return u
-}
-
-// NEW: if DDG returns an album page, fetch it and try to extract a track
-func (mb *MusicBot) tryAlbumToTrack(albumURL string) string {
-	resp, err := mb.fetch(albumURL)
-	if err != nil {
-		return ""
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return ""
-	}
-	// 1) look for spotify:track:ID in scripts
-	if id := func() string {
-		var id string
-		doc.Find("script").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-			if m := reSpotifyURI.FindStringSubmatch(s.Text()); len(m) == 2 {
-				id = m[1]
-				return false
-			}
-			return true
-		})
-		return id
-	}(); id != "" {
-		return "https://open.spotify.com/track/" + id
-	}
-	// 2) anchors with /track/
-	track := ""
-	doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
-		if href, _ := a.Attr("href"); href != "" {
-			if u := canonicalSpotifyTrack(href); u != "" {
-				track = u
-				return false
-			}
-		}
-		return true
-	})
-	return track
-}
-
-func (mb *MusicBot) searchSpotify(info *SongInfo) string {
-	key := normalizeQuery(info.Artist, info.Title)
-	if v, ok := mb.queryCache.Get("sp:" + key); ok {
-		return v
-	}
-
-	query := key
-	searchURL := fmt.Sprintf("https://open.spotify.com/search/%s", url.QueryEscape(query))
-
-	// Try scraping the search page first (works occasionally when HTML contains preloaded data)
-	if resp, err := mb.fetch(searchURL); err == nil {
-		func() {
-			defer func() {
-				if resp != nil && resp.Body != nil {
-					io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
-				}
-			}()
-			doc, err2 := goquery.NewDocumentFromReader(resp.Body)
-			if err2 == nil {
-				// look for spotify:track:ID in scripts
-				foundID := ""
-				doc.Find("script").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-					t := s.Text()
-					if m := reSpotifyURI.FindStringSubmatch(t); len(m) == 2 {
-						foundID = m[1]
-						return false
-					}
-					return true
-				})
-				if foundID != "" {
-					u := "https://open.spotify.com/track/" + foundID
-					mb.queryCache.Set("sp:"+key, u, 24*time.Hour)
-					return
-				}
-				// anchors
-				var track string
-				doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
-					href, _ := a.Attr("href")
-					if href == "" {
-						return true
-					}
-					if u := canonicalSpotifyTrack(href); u != "" {
-						track = u
-						return false
-					}
-					return true
-				})
-				if track != "" {
-					mb.queryCache.Set("sp:"+key, track, 24*time.Hour)
-					return
-				}
-			}
-		}()
-	}
-
-	// DDG fallback (reliable, no API keys) — try exact quoted, then loose
-	if u := mb.searchSpotifyViaDDG2(info.Artist, info.Title); u != "" {
-		mb.queryCache.Set("sp:"+key, u, 24*time.Hour)
-		return u
-	}
-
-	// As a last resort return the search page (DO NOT cache failures)
-	return searchURL
-}
-
-func (mb *MusicBot) searchSpotifyViaDDG2(artist, title string) string {
-	// pass 1: exact (quoted) — best precision
-	t := normalizeForMatch(title)
-	a := normalizeForMatch(artist)
-	parts := []string{"site:open.spotify.com/track"}
-	if t != "" {
-		parts = append(parts, fmt.Sprintf(`"%s"`, t))
-	}
-	if a != "" {
-		parts = append(parts, fmt.Sprintf(`"%s"`, a))
-	}
-	q := strings.Join(parts, " ")
-	ddg := "https://duckduckgo.com/html/?q=" + url.QueryEscape(q)
-
-	resp, err := mb.fetch(ddg)
-	if err != nil {
-		return ""
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return ""
-	}
-
-	found := ""
-	doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
-		href, _ := a.Attr("href")
-		u := resolveDDGLink(href)
-		if track := canonicalSpotifyTrack(u); track != "" {
-			found = track
-			return false
-		}
-		// NEW: if DDG gave us an album, try to resolve to its first track
-		if reSpotifyAlbum.MatchString(u) {
-			if track := mb.tryAlbumToTrack(u); track != "" {
-				found = track
-				return false
-			}
-		}
-		return true
-	})
-	if found != "" {
-		return found
-	}
-
-	// pass 2: loose — better recall for tricky scripts/diacritics
-	if t == "" && a == "" {
-		return ""
-	}
-	q2 := "site:open.spotify.com/track " + strings.TrimSpace(t+" "+a)
-	ddg2 := "https://duckduckgo.com/html/?q=" + url.QueryEscape(q2)
-
-	resp2, err := mb.fetch(ddg2)
-	if err != nil {
-		return ""
-	}
-	defer func() { io.Copy(io.Discard, resp2.Body); resp2.Body.Close() }()
-
-	doc2, err := goquery.NewDocumentFromReader(resp2.Body)
-	if err != nil {
-		return ""
-	}
-
-	doc2.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
-		href, _ := a.Attr("href")
-		u := resolveDDGLink(href)
-		if track := canonicalSpotifyTrack(u); track != "" {
-			found = track
-			return false
-		}
-		if reSpotifyAlbum.MatchString(u) {
-			if track := mb.tryAlbumToTrack(u); track != "" {
-				found = track
-				return false
-			}
-		}
-		return true
-	})
-	return found
-}
-
-// ---------------------------
-// Apple helpers
-// ---------------------------
-
-func storefrontFromAppleURL(u *url.URL) string {
-	// formats: /us/album/... or /ua/song/...
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) > 0 && len(parts[0]) == 2 {
-		return strings.ToUpper(parts[0])
-	}
-	return "US"
-}
-
-func (mb *MusicBot) searchAppleMusic(info *SongInfo) string {
-	key := normalizeQuery(info.Artist, info.Title)
-	if v, ok := mb.queryCache.Get("am:" + key); ok {
-		return v
-	}
-
-	if info.Platform == "Apple Music" && info.OriginalURL != "" {
-		mb.queryCache.Set("am:"+key, info.OriginalURL, 24*time.Hour)
-		return info.OriginalURL
-	}
-	query := key
-	searchURL := fmt.Sprintf("https://music.apple.com/search?term=%s", url.QueryEscape(query))
-
-	// Try Apple Music search HTML (may or may not contain anchors server-side)
-	if resp, err := mb.fetch(searchURL); err == nil {
-		func() {
-			defer func() {
-				if resp != nil && resp.Body != nil {
-					io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
-				}
-			}()
-			doc, err2 := goquery.NewDocumentFromReader(resp.Body)
-			if err2 == nil {
-				var found string
-				doc.Find("a").EachWithBreak(func(_ int, a *goquery.Selection) bool {
-					href, _ := a.Attr("href")
-					if href == "" {
-						return true
-					}
-					if strings.Contains(href, "/song/") || (strings.Contains(href, "/album/") && strings.Contains(href, "?i=")) {
-						found = joinApple(searchURL, href)
-						return false
-					}
-					return true
-				})
-				if found != "" {
-					mb.queryCache.Set("am:"+key, found, 24*time.Hour)
-					return
-				}
-			}
-		}()
-	}
-
-	// iTunes Search API with scoring; pass storefront country if we can
-	country := "US"
-	if info.OriginalURL != "" {
-		if u, err := url.Parse(info.OriginalURL); err == nil {
-			country = storefrontFromAppleURL(u)
-		}
-	}
-	api := fmt.Sprintf("https://itunes.apple.com/search?term=%s&media=music&entity=song&limit=10&country=%s", url.QueryEscape(query), country)
-	if resp2, err := mb.fetch(api); err == nil {
-		defer func() { io.Copy(io.Discard, resp2.Body); resp2.Body.Close() }()
-		var res struct {
-			Results []struct {
-				TrackViewURL string `json:"trackViewUrl"`
-				TrackName    string `json:"trackName"`
-				ArtistName   string `json:"artistName"`
-			} `json:"results"`
-		}
-		if err := json.NewDecoder(resp2.Body).Decode(&res); err == nil {
-			wantT := normalizeForMatch(info.Title)
-			wantA := normalizeForMatch(info.Artist)
-			best := ""
-			bestScore := -999
-			for _, r := range res.Results {
-				if r.TrackViewURL == "" {
-					continue
-				}
-				t := normalizeForMatch(r.TrackName)
-				a := normalizeForMatch(r.ArtistName)
-				score := 0
-				if wantT != "" && strings.Contains(t, wantT) {
-					score += 3
-				}
-				if wantA != "" && strings.Contains(a, wantA) {
-					score += 3
-				}
-				if score > bestScore {
-					bestScore = score
-					best = r.TrackViewURL
-				}
-			}
-			if bestScore >= 3 && best != "" {
-				// prefer music.apple.com domain
-				best = strings.Replace(best, "itunes.apple.com", "music.apple.com", 1)
-				mb.queryCache.Set("am:"+key, best, 24*time.Hour)
-				return best
-			}
-		}
-	}
-
-	// Last resort: return search page (DO NOT cache failures)
-	return searchURL
-}
-
-// ---------------------------
-// JSON helpers
-// ---------------------------
-
-func jsonObjectFromScriptContaining(doc *goquery.Document, needle string) string {
-	var out string
-	doc.Find("script").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-		t := s.Text()
-		idx := strings.Index(t, needle)
-		if idx == -1 {
-			return true
-		}
-		start := strings.Index(t[idx:], "{")
-		if start == -1 {
-			return true
-		}
-		start += idx
-		depth := 0
-		for i := start; i < len(t); i++ {
-			switch t[i] {
-			case '{':
-				depth++
-			case '}':
-				depth--
-				if depth == 0 {
-					out = t[start : i+1]
-					return false
-				}
-			}
-		}
-		return true
-	})
-	return out
-}
-
-type ytCandidate struct {
-	ID      string
-	Title   string
-	Channel string
-}
-
-func collectYouTubeCandidates(v interface{}, out *[]ytCandidate) {
-	switch x := v.(type) {
-	case map[string]interface{}:
-		var id, title, channel string
-		if vr, ok := x["videoId"].(string); ok {
-			id = vr
-		}
-		if t, ok := x["title"].(map[string]interface{}); ok {
-			if runs, ok := t["runs"].([]interface{}); ok && len(runs) > 0 {
-				if m, ok := runs[0].(map[string]interface{}); ok {
-					if tx, ok := m["text"].(string); ok {
-						title = tx
-					}
-				}
-			} else if st, ok := t["simpleText"].(string); ok {
-				title = st
-			}
-		}
-		if lb, ok := x["longBylineText"].(map[string]interface{}); ok {
-			if runs, ok := lb["runs"].([]interface{}); ok && len(runs) > 0 {
-				if m, ok := runs[0].(map[string]interface{}); ok {
-					if tx, ok := m["text"].(string); ok {
-						channel = tx
-					}
-				}
-			}
-		} else if ow, ok := x["ownerText"].(map[string]interface{}); ok {
-			if runs, ok := ow["runs"].([]interface{}); ok && len(runs) > 0 {
-				if m, ok := runs[0].(map[string]interface{}); ok {
-					if tx, ok := m["text"].(string); ok {
-						channel = tx
-					}
-				}
-			}
-		}
-		if id != "" {
-			*out = append(*out, ytCandidate{ID: id, Title: title, Channel: channel})
-		}
-		for _, vv := range x {
-			collectYouTubeCandidates(vv, out)
-		}
-	case []interface{}:
-		for _, vv := range x {
-			collectYouTubeCandidates(vv, out)
-		}
-	}
-}
-
-func scoreYouTubeCandidate(c ytCandidate, wantArtist, wantTitle string) int {
-	score := 0
-	na := normalizeForMatch(wantArtist)
-	nt := normalizeForMatch(wantTitle)
-	ct := normalizeForMatch(c.Title)
-	cc := normalizeForMatch(c.Channel)
-
-	if strings.Contains(ct, nt) {
-		score += 4
-	}
-	if strings.Contains(ct, na) {
-		score += 3
-	}
-	if strings.Contains(cc, na) {
-		score += 2
-	}
-	// prefer auto-generated artist topic channels slightly
-	if strings.HasSuffix(cc, " - topic") {
-		score += 2
-	}
-
-	bad := []string{"cover", "lyrics", "lyric", "live", "karaoke", "sped up", "speed up", "nightcore", "8d", "slowed"}
-	for _, b := range bad {
-		if strings.Contains(ct, b) {
-			score -= 2
-		}
-	}
-	if strings.Contains(ct, "remix") && !strings.Contains(nt, "remix") {
-		score -= 1
-	}
-	return score
-}
-
-func findPreferredYouTubeVideoID(v interface{}, artist, title string) string {
-	var cands []ytCandidate
-	collectYouTubeCandidates(v, &cands)
-	bestScore := -999
-	bestID := ""
-	for _, c := range cands {
-		if c.ID == "" {
-			continue
-		}
-		s := scoreYouTubeCandidate(c, artist, title)
-		if s > bestScore {
-			bestScore = s
-			bestID = c.ID
-		}
-	}
-	return bestID
-}
-
-func extractFirstYouTubeVideoID(v interface{}) string {
-	switch x := v.(type) {
-	case map[string]interface{}:
-		if idRaw, ok := x["videoId"]; ok {
-			if s, ok := idRaw.(string); ok && len(s) >= 8 {
-				return s
-			}
-		}
-		for _, vv := range x {
-			if id := extractFirstYouTubeVideoID(vv); id != "" {
-				return id
-			}
-		}
-	case []interface{}:
-		for _, vv := range x {
-			if id := extractFirstYouTubeVideoID(vv); id != "" {
-				return id
-			}
-		}
-	}
-	return ""
-}
-
-// ---------------------------
-// Extraction entry
+// Platform Extraction
 // ---------------------------
 
 func (mb *MusicBot) extractSongInfo(text string) *SongInfo {
@@ -1595,90 +559,1645 @@ func (mb *MusicBot) extractSongInfo(text string) *SongInfo {
 }
 
 // ---------------------------
-// simple in-memory TTL cache
+// Spotify Info (Improved)
 // ---------------------------
 
-type cacheEntry struct {
-	val string
-	exp time.Time
-}
-
-type simpleCache struct {
-	mu sync.Mutex
-	m  map[string]cacheEntry
-}
-
-func newSimpleCache() *simpleCache { return &simpleCache{m: make(map[string]cacheEntry)} }
-
-func (c *simpleCache) Get(k string) (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.m[k]
-	if !ok || time.Now().After(e.exp) {
-		return "", false
+func (mb *MusicBot) getSpotifyInfo(spotifyURL string) *SongInfo {
+	// Check cache first
+	if v, ok := mb.urlCache.Get("info:" + spotifyURL); ok {
+		var si SongInfo
+		if json.Unmarshal([]byte(v), &si) == nil {
+			return &si
+		}
 	}
-	return e.val, true
+
+	// Check negative cache
+	if _, ok := mb.negativeCache.Get("info:" + spotifyURL); ok {
+		if mb.config.Debug {
+			mb.logger.Debug("Spotify URL in negative cache, skipping", zap.String("url", spotifyURL))
+		}
+		return nil
+	}
+
+	if !reSpotifyTrack.MatchString(spotifyURL) {
+		return nil
+	}
+
+	// Use circuit breaker
+	result, err := mb.spotifyBreaker.Execute(func() (interface{}, error) {
+		return mb.extractSpotifyWithFallbacks(spotifyURL)
+	})
+
+	if err != nil {
+		mb.logger.Error("Spotify circuit breaker error", zap.Error(err))
+		mb.negativeCache.Set("info:"+spotifyURL, "failed", mb.config.NegativeCacheTTL)
+		return nil
+	}
+
+	if result == nil {
+		mb.negativeCache.Set("info:"+spotifyURL, "failed", mb.config.NegativeCacheTTL)
+		return nil
+	}
+
+	si := result.(*SongInfo)
+	// Cache successful result
+	if b, err := json.Marshal(si); err == nil {
+		mb.urlCache.Set("info:"+spotifyURL, string(b), mb.config.CacheTTL)
+	}
+	return si
 }
 
-func (c *simpleCache) Set(k, v string, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.m[k] = cacheEntry{val: v, exp: time.Now().Add(ttl)}
+// extractSpotifyWithFallbacks tries all 6 extraction methods for Spotify
+func (mb *MusicBot) extractSpotifyWithFallbacks(spotifyURL string) (*SongInfo, error) {
+	// Layer 1: Try current OEmbed API
+	if info := mb.trySpotifyOEmbed(spotifyURL); info != nil {
+		return info, nil
+	}
+
+	// Layer 2: Try legacy OEmbed endpoint
+	if info := mb.trySpotifyLegacyOEmbed(spotifyURL); info != nil {
+		return info, nil
+	}
+
+	// Layer 3: Try __NEXT_DATA__ extraction
+	if info := mb.extractFromSpotifyEmbed(spotifyURL); info != nil && info.Artist != "" {
+		return info, nil
+	}
+
+	// Layer 4: Try JSON-LD structured data
+	if info := mb.trySpotifyJSONLD(spotifyURL); info != nil {
+		return info, nil
+	}
+
+	// Layer 5: Try OpenGraph meta tags
+	if info := mb.fallbackSpotifyScrape(spotifyURL); info != nil {
+		return info, nil
+	}
+
+	// Layer 6: Try text mirror fallback
+	if info := mb.trySpotifyTextMirror(spotifyURL); info != nil {
+		return info, nil
+	}
+
+	return nil, fmt.Errorf("all Spotify extraction methods failed")
+}
+
+// trySpotifyOEmbed attempts standard OEmbed API (Layer 1)
+func (mb *MusicBot) trySpotifyOEmbed(spotifyURL string) *SongInfo {
+	oembedURL := fmt.Sprintf("https://open.spotify.com/oembed?url=%s", url.QueryEscape(spotifyURL))
+	resp, err := mb.fetch(oembedURL)
+	if err != nil {
+		if mb.config.Debug {
+			mb.logger.Debug("Spotify OEmbed error", zap.Error(err))
+		}
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	var oembed OEmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&oembed); err != nil {
+		if mb.config.Debug {
+			mb.logger.Debug("Spotify OEmbed decode error", zap.Error(err))
+		}
+		return nil
+	}
+
+	if mb.config.Debug {
+		log.Printf("🔍 [Spotify] OEmbed response: title=%q artist=%q desc=%q", oembed.Title, oembed.AuthorName, oembed.Description)
+	}
+
+	title := strings.TrimSpace(oembed.Title)
+	artist := strings.TrimSpace(oembed.AuthorName)
+	title = strings.TrimSuffix(title, " | Spotify")
+
+	// Parse description for missing fields
+	if desc := strings.TrimSpace(oembed.Description); desc != "" && (title == "" || artist == "") {
+		parts := reMidDotSep.Split(strings.ReplaceAll(desc, "\u00A0", " "), -1)
+
+		if artist == "" && len(parts) >= 2 {
+			p0, p1 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			switch {
+			case title != "" && strings.EqualFold(p0, title):
+				artist = p1
+			case title != "" && strings.EqualFold(p1, title):
+				artist = p0
+			case isAlbumish(p0) && !isAlbumish(p1):
+				artist = p1
+			case isAlbumish(p1) && !isAlbumish(p0):
+				artist = p0
+			default:
+				artist = p1
+			}
+		}
+
+		if title == "" && len(parts) >= 2 {
+			p0, p1 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			switch {
+			case artist != "" && strings.EqualFold(p0, artist):
+				title = p1
+			case artist != "" && strings.EqualFold(p1, artist):
+				title = p0
+			case !isAlbumish(p0) && isAlbumish(p1):
+				title = p0
+			case !isAlbumish(p1) && isAlbumish(p0):
+				title = p1
+			default:
+				title = p0
+			}
+		}
+	}
+
+	// Try to parse from title if artist missing
+	if artist == "" && strings.Contains(strings.ToLower(title), " by ") {
+		if idx := strings.Index(strings.ToLower(title), " by "); idx != -1 {
+			artist = title[idx+4:]
+			title = title[:idx]
+		}
+	}
+
+	// NEW: Try embed page extraction if artist missing
+	if artist == "" {
+		if mb.config.Debug {
+			log.Printf("🔍 [Spotify] Artist missing from OEmbed, trying embed page")
+		}
+		if embedInfo := mb.extractFromSpotifyEmbed(spotifyURL); embedInfo != nil && embedInfo.Artist != "" {
+			artist = embedInfo.Artist
+			if title == "" && embedInfo.Title != "" {
+				title = embedInfo.Title
+			}
+		}
+	}
+
+	// Fallback to scraping if parsing looks wrong
+	if artist == "" || isAlbumish(artist) ||
+		(looksLikeArtistList(title) && !looksLikeArtistList(artist)) ||
+		strings.EqualFold(title, artist) {
+		if mb.config.Debug {
+			log.Printf("🔍 [Spotify] Artist missing or invalid (%q), falling back to scrape", artist)
+		}
+		if scraped := mb.fallbackSpotifyScrape(spotifyURL); scraped != nil {
+			if scraped.Title != "" && scraped.Artist != "" {
+				if b, err := json.Marshal(scraped); err == nil {
+					mb.urlCache.Set("info:"+spotifyURL, string(b), mb.config.CacheTTL)
+				}
+				return scraped
+			}
+			if artist == "" && scraped.Artist != "" {
+				artist = scraped.Artist
+			}
+			if title == "" && scraped.Title != "" {
+				title = scraped.Title
+			}
+		}
+	}
+
+	if title == "" {
+		if scraped := mb.fallbackSpotifyScrape(spotifyURL); scraped != nil {
+			if b, err := json.Marshal(scraped); err == nil {
+				mb.urlCache.Set("info:"+spotifyURL, string(b), mb.config.CacheTTL)
+			}
+			return scraped
+		}
+	}
+
+	si := &SongInfo{Title: title, Artist: artist, Platform: "Spotify", OriginalURL: spotifyURL}
+	return si
+}
+
+// trySpotifyLegacyOEmbed attempts legacy OEmbed endpoint (Layer 2)
+func (mb *MusicBot) trySpotifyLegacyOEmbed(spotifyURL string) *SongInfo {
+	// Some regions/locales may use different oEmbed endpoint
+	legacyURL := fmt.Sprintf("https://embed.spotify.com/oembed/?url=%s", url.QueryEscape(spotifyURL))
+	resp, err := mb.fetch(legacyURL)
+	if err != nil {
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	var oembed OEmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&oembed); err != nil {
+		return nil
+	}
+
+	title := strings.TrimSpace(oembed.Title)
+	artist := strings.TrimSpace(oembed.AuthorName)
+
+	if title != "" && artist != "" {
+		return &SongInfo{
+			Title:       title,
+			Artist:      artist,
+			Platform:    "Spotify",
+			OriginalURL: spotifyURL,
+		}
+	}
+
+	return nil
+}
+
+// trySpotifyJSONLD attempts JSON-LD structured data extraction (Layer 4)
+func (mb *MusicBot) trySpotifyJSONLD(spotifyURL string) *SongInfo {
+	resp, err := mb.fetch(spotifyURL)
+	if err != nil {
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return nil
+	}
+
+	var title, artist string
+	doc.Find("script[type='application/ld+json']").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		raw := strings.TrimSpace(s.Text())
+		if raw == "" {
+			return true
+		}
+
+		var data map[string]interface{}
+		if json.Unmarshal([]byte(raw), &data) != nil {
+			return true
+		}
+
+		typeStr, _ := data["@type"].(string)
+		if typeStr == "MusicRecording" || typeStr == "MusicAlbum" {
+			if n, ok := data["name"].(string); ok {
+				title = n
+			}
+
+			if by, ok := data["byArtist"].(map[string]interface{}); ok {
+				if name, ok := by["name"].(string); ok {
+					artist = name
+				}
+			}
+
+			if title != "" && artist != "" {
+				return false
+			}
+		}
+
+		return true
+	})
+
+	if title != "" && artist != "" {
+		return &SongInfo{
+			Title:       title,
+			Artist:      artist,
+			Platform:    "Spotify",
+			OriginalURL: spotifyURL,
+		}
+	}
+
+	return nil
+}
+
+// trySpotifyTextMirror attempts text mirror fallback (Layer 6)
+func (mb *MusicBot) trySpotifyTextMirror(spotifyURL string) *SongInfo {
+	resp, err := mb.fetchViaTextMirror(spotifyURL)
+	if err != nil {
+		if mb.config.Debug {
+			mb.logger.Debug("Text mirror fetch failed", zap.Error(err))
+		}
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return nil
+	}
+
+	ogTitle := doc.Find("meta[property='og:title']").AttrOr("content", "")
+	ogDesc := doc.Find("meta[property='og:description']").AttrOr("content", "")
+
+	title, artist := splitFromOgTitle(ogTitle, ogDesc)
+	if title != "" && artist != "" {
+		return &SongInfo{
+			Title:       title,
+			Artist:      artist,
+			Platform:    "Spotify",
+			OriginalURL: spotifyURL,
+		}
+	}
+
+	return nil
+}
+
+// Extract from Spotify embed page - __NEXT_DATA__ extraction (Layer 3)
+func (mb *MusicBot) extractFromSpotifyEmbed(spotifyURL string) *SongInfo {
+	match := reSpotifyTrack.FindStringSubmatch(spotifyURL)
+	if len(match) < 2 {
+		return nil
+	}
+
+	trackID := match[1]
+	embedURL := fmt.Sprintf("https://open.spotify.com/embed/track/%s", trackID)
+
+	resp, err := mb.fetch(embedURL)
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [Spotify Embed] Fetch error: %v", err)
+		}
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	// Find __NEXT_DATA__ JSON
+	matches := reNextData.FindSubmatch(body)
+	if len(matches) < 2 {
+		return nil
+	}
+
+	var data struct {
+		Props struct {
+			PageProps struct {
+				State struct {
+					Data struct {
+						Entity struct {
+							Name    string `json:"name"`
+							Title   string `json:"title"`
+							Artists []struct {
+								Name string `json:"name"`
+							} `json:"artists"`
+						} `json:"entity"`
+					} `json:"data"`
+				} `json:"state"`
+			} `json:"pageProps"`
+		} `json:"props"`
+	}
+
+	if err := json.Unmarshal(matches[1], &data); err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [Spotify Embed] JSON parse error: %v", err)
+		}
+		return nil
+	}
+
+	entity := data.Props.PageProps.State.Data.Entity
+	title := entity.Name
+	if title == "" {
+		title = entity.Title
+	}
+
+	var artist string
+	if len(entity.Artists) > 0 {
+		artist = entity.Artists[0].Name
+	}
+
+	if mb.config.Debug {
+		log.Printf("🔍 [Spotify Embed] Extracted: title=%q artist=%q", title, artist)
+	}
+
+	if title != "" && artist != "" {
+		return &SongInfo{
+			Title:       title,
+			Artist:      artist,
+			Platform:    "Spotify",
+			OriginalURL: spotifyURL,
+		}
+	}
+
+	return nil
+}
+
+func (mb *MusicBot) fallbackSpotifyScrape(spotifyURL string) *SongInfo {
+	resp, err := mb.fetch(spotifyURL)
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [Spotify scrape] Fetch error: %v", err)
+		}
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	if mb.config.Debug {
+		preview := string(body)
+		if len(preview) > 500 {
+			preview = preview[:500]
+		}
+		log.Printf("🔍 [Spotify scrape] HTML length: %d", len(body))
+		log.Printf("🔍 [Spotify scrape] HTML preview: %s", preview)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [Spotify scrape] Parse error: %v", err)
+		}
+		return nil
+	}
+
+	ogTitle := doc.Find("meta[property='og:title']").AttrOr("content", "")
+	ogDesc := doc.Find("meta[property='og:description']").AttrOr("content", "")
+
+	if mb.config.Debug {
+		log.Printf("🔍 [Spotify scrape] og:title: %q", ogTitle)
+		log.Printf("🔍 [Spotify scrape] og:description: %q", ogDesc)
+		log.Printf("🔍 [Spotify scrape] All meta tags: %d", doc.Find("meta[property^='og:']").Length())
+	}
+
+	// Try robust split from og:title
+	ti, ar := splitFromOgTitle(ogTitle, ogDesc)
+	if mb.config.Debug {
+		log.Printf("🔍 [Spotify scrape] splitFromOgTitle result: title=%q artist=%q", ti, ar)
+	}
+	if ti != "" && ar != "" {
+		return &SongInfo{Title: ti, Artist: ar, Platform: "Spotify", OriginalURL: spotifyURL}
+	}
+
+	// Fallback to simpler parsing
+	cleanTitle := strings.TrimSuffix(ogTitle, " | Spotify")
+	cleanTitle = strings.ReplaceAll(cleanTitle, " — ", " - ")
+	cleanTitle = strings.ReplaceAll(cleanTitle, " – ", " - ")
+
+	if idx := strings.Index(strings.ToLower(cleanTitle), " by "); idx != -1 {
+		return &SongInfo{
+			Title:       strings.TrimSpace(cleanTitle[:idx]),
+			Artist:      strings.TrimSpace(cleanTitle[idx+4:]),
+			Platform:    "Spotify",
+			OriginalURL: spotifyURL,
+		}
+	}
+
+	if strings.Contains(cleanTitle, " - ") {
+		parts := strings.SplitN(cleanTitle, " - ", 2)
+		return &SongInfo{
+			Title:       strings.TrimSpace(parts[0]),
+			Artist:      strings.TrimSpace(parts[1]),
+			Platform:    "Spotify",
+			OriginalURL: spotifyURL,
+		}
+	}
+
+	// Last resort: salvage artist from description
+	if ogDesc != "" {
+		parts := reMidDotSep.Split(strings.ReplaceAll(ogDesc, "\u00A0", " "), -1)
+		if len(parts) > 0 {
+			artistGuess := strings.TrimSpace(parts[0])
+			if artistGuess != "" {
+				return &SongInfo{
+					Title:       cleanTitle,
+					Artist:      artistGuess,
+					Platform:    "Spotify",
+					OriginalURL: spotifyURL,
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // ---------------------------
-// Small helpers for YouTube URLs
+// YouTube Info (Improved)
 // ---------------------------
+
+func (mb *MusicBot) getYouTubeInfo(youtubeURL string, platform string) *SongInfo {
+	if v, ok := mb.urlCache.Get("info:" + youtubeURL); ok {
+		var si SongInfo
+		if json.Unmarshal([]byte(v), &si) == nil {
+			return &si
+		}
+	}
+
+	// Try OEmbed first
+	oembedURL := fmt.Sprintf("https://www.youtube.com/oembed?format=json&url=%s", url.QueryEscape(youtubeURL))
+	resp, err := mb.fetch(oembedURL)
+	if err == nil {
+		defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+		var data struct {
+			Title      string `json:"title"`
+			AuthorName string `json:"author_name"`
+		}
+
+		if json.NewDecoder(resp.Body).Decode(&data) == nil && data.Title != "" {
+			if mb.config.Debug {
+				log.Printf("🔍 [%s] OEmbed response: title=%q author=%q", platform, data.Title, data.AuthorName)
+			}
+
+			title, artist := cleanYouTubeInfo(data.Title, data.AuthorName)
+
+			if mb.config.Debug {
+				log.Printf("🔍 [%s] Extracted from OEmbed: title=%q artist=%q", platform, title, artist)
+			}
+
+			si := &SongInfo{
+				Title:       title,
+				Artist:      artist,
+				Platform:    platform,
+				OriginalURL: youtubeURL,
+			}
+			if b, err := json.Marshal(si); err == nil {
+				mb.urlCache.Set("info:"+youtubeURL, string(b), mb.config.CacheTTL)
+			}
+			return si
+		}
+	}
+
+	// Fallback to scraping
+	resp, err = mb.fetch(youtubeURL)
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [%s] Fetch error: %v", platform, err)
+		}
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	// Try to find ytInitialPlayerResponse
+	re := regexp.MustCompile(`ytInitialPlayerResponse\s*=\s*(\{.+?\});`)
+	matches := re.FindSubmatch(body)
+	if len(matches) > 1 {
+		var data struct {
+			VideoDetails struct {
+				Title  string `json:"title"`
+				Author string `json:"author"`
+			} `json:"videoDetails"`
+		}
+
+		if json.Unmarshal(matches[1], &data) == nil && data.VideoDetails.Title != "" {
+			title, artist := cleanYouTubeInfo(data.VideoDetails.Title, data.VideoDetails.Author)
+
+			si := &SongInfo{
+				Title:       title,
+				Artist:      artist,
+				Platform:    platform,
+				OriginalURL: youtubeURL,
+			}
+			if b, err := json.Marshal(si); err == nil {
+				mb.urlCache.Set("info:"+youtubeURL, string(b), mb.config.CacheTTL)
+			}
+			return si
+		}
+	}
+
+	// Fallback to og:title
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return nil
+	}
+
+	title := doc.Find("meta[property='og:title']").AttrOr("content", "")
+	title = strings.ReplaceAll(title, " - YouTube Music", "")
+	title = strings.ReplaceAll(title, " - YouTube", "")
+
+	if strings.Contains(title, " - ") {
+		parts := strings.SplitN(title, " - ", 2)
+		si := &SongInfo{
+			Title:       strings.TrimSpace(parts[1]),
+			Artist:      strings.TrimSpace(parts[0]),
+			Platform:    platform,
+			OriginalURL: youtubeURL,
+		}
+		if b, err := json.Marshal(si); err == nil {
+			mb.urlCache.Set("info:"+youtubeURL, string(b), mb.config.CacheTTL)
+		}
+		return si
+	}
+
+	if title != "" {
+		si := &SongInfo{
+			Title:       strings.TrimSpace(title),
+			Artist:      "",
+			Platform:    platform,
+			OriginalURL: youtubeURL,
+		}
+		if b, err := json.Marshal(si); err == nil {
+			mb.urlCache.Set("info:"+youtubeURL, string(b), mb.config.CacheTTL)
+		}
+		return si
+	}
+
+	return nil
+}
+
+// NEW: Clean YouTube artist info (like JS version)
+func cleanYouTubeInfo(title, artist string) (string, string) {
+	// Remove Topic suffix
+	artist = strings.TrimSuffix(artist, " - Topic")
+
+	// Remove VEVO/Official
+	artist = reVEVO.ReplaceAllString(artist, "")
+	artist = reOfficial.ReplaceAllString(artist, "")
+	artist = strings.TrimSpace(artist)
+
+	// Fix camelCase (e.g., "TaylorSwift" → "Taylor Swift")
+	artist = reCamelCase.ReplaceAllString(artist, "$1 $2")
+
+	// Remove artist prefix from title
+	if artist != "" {
+		prefix := strings.ToLower(artist) + " - "
+		if strings.HasPrefix(strings.ToLower(title), prefix) {
+			title = title[len(prefix):]
+		}
+	}
+
+	return strings.TrimSpace(title), strings.TrimSpace(artist)
+}
+
+// ---------------------------
+// Apple Music Info (Improved)
+// ---------------------------
+
+func (mb *MusicBot) getAppleMusicInfo(appleURL string) *SongInfo {
+	if v, ok := mb.urlCache.Get("info:" + appleURL); ok {
+		var si SongInfo
+		if json.Unmarshal([]byte(v), &si) == nil {
+			return &si
+		}
+	}
+
+	resp, err := mb.fetch(appleURL)
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [Apple Music] Fetch error: %v", err)
+		}
+		return nil
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [Apple Music] Parse error: %v", err)
+		}
+		return nil
+	}
+
+	title, artist := extractAppleLD(doc)
+
+	if title == "" {
+		title = doc.Find("meta[property='og:title']").AttrOr("content", "")
+	}
+
+	// Parse og:title if needed
+	if title != "" && artist == "" {
+		cleanOgTitle := title
+		for fancy, plain := range fancyQuotes {
+			cleanOgTitle = strings.ReplaceAll(cleanOgTitle, fancy, plain)
+		}
+
+		// Pattern 1: "Title by Artist on Apple Music"
+		if strings.Contains(cleanOgTitle, " by ") && strings.Contains(cleanOgTitle, " on Apple Music") {
+			parts := strings.SplitN(cleanOgTitle, " by ", 2)
+			title = strings.TrimSpace(parts[0])
+			artist = strings.TrimSpace(strings.ReplaceAll(parts[1], " on Apple Music", ""))
+		} else if strings.Contains(cleanOgTitle, ",") && reAppleMusicSuffix.MatchString(cleanOgTitle) {
+			parts := strings.SplitN(cleanOgTitle, ",", 2)
+			if len(parts) == 2 {
+				title = strings.TrimSpace(parts[0])
+				artist = strings.TrimSpace(reAppleMusicSuffix.ReplaceAllString(parts[1], ""))
+			}
+		}
+	}
+
+	// Clean up
+	title, artist = cleanTitleArtist(title, artist)
+
+	// Handle "Title by Artist" format
+	if strings.Contains(title, " by ") {
+		byIndex := strings.Index(title, " by ")
+		titlePart := strings.TrimSpace(title[:byIndex])
+		artistPart := strings.TrimSpace(title[byIndex+4:])
+
+		if artist == "" || strings.EqualFold(artist, artistPart) {
+			title = titlePart
+			if artist == "" {
+				artist = artistPart
+			}
+		}
+	}
+
+	title = strings.TrimSpace(strings.NewReplacer(
+		" - Single", "",
+		" - EP", "",
+		" - Album", "",
+		" on Apple Music", "",
+		" в Apple Music", "",
+	).Replace(title))
+
+	if title == "" {
+		return nil
+	}
+
+	si := &SongInfo{
+		Title:       title,
+		Artist:      artist,
+		Platform:    "Apple Music",
+		OriginalURL: appleURL,
+	}
+	if b, err := json.Marshal(si); err == nil {
+		mb.urlCache.Set("info:"+appleURL, string(b), mb.config.CacheTTL)
+	}
+	return si
+}
+
+// Improved Apple Music JSON-LD extraction (like JS version)
+func extractAppleLD(doc *goquery.Document) (title, artist string) {
+	doc.Find("script[type='application/ld+json']").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		raw := strings.TrimSpace(s.Text())
+		if raw == "" {
+			return true
+		}
+
+		var any interface{}
+		if json.Unmarshal([]byte(raw), &any) != nil {
+			return true
+		}
+
+		var objects []map[string]interface{}
+		switch v := any.(type) {
+		case map[string]interface{}:
+			objects = append(objects, v)
+		case []interface{}:
+			for _, it := range v {
+				if m, ok := it.(map[string]interface{}); ok {
+					objects = append(objects, m)
+				}
+			}
+		default:
+			return true
+		}
+
+		for _, obj := range objects {
+			typeStr, _ := obj["@type"].(string)
+			if typeStr == "MusicRecording" || typeStr == "MusicAlbum" ||
+				typeStr == "CreativeWork" || typeStr == "MusicComposition" {
+				if n, ok := obj["name"].(string); ok && n != "" {
+					title = n
+				}
+
+				// Check for byArtist at current level
+				if by, ok := obj["byArtist"]; ok {
+					artist = extractArtistName(by)
+				}
+
+				// NEW: Check nested audio object for MusicRecording
+				if artist == "" {
+					if audioObj, ok := obj["audio"].(map[string]interface{}); ok {
+						if by, ok := audioObj["byArtist"]; ok {
+							artist = extractArtistName(by)
+						}
+						if title == "" {
+							if n, ok := audioObj["name"].(string); ok && n != "" {
+								title = n
+							}
+						}
+					}
+				}
+
+				if title != "" && artist != "" {
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return
+}
+
+func extractArtistName(by interface{}) string {
+	switch v := by.(type) {
+	case string:
+		return v
+	case map[string]interface{}:
+		if name, ok := v["name"].(string); ok {
+			return name
+		}
+	case []interface{}:
+		if len(v) > 0 {
+			if m, ok := v[0].(map[string]interface{}); ok {
+				if name, ok := m["name"].(string); ok {
+					return name
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// ---------------------------
+// Search
+// ---------------------------
+
+func (mb *MusicBot) findOnAllPlatforms(info *SongInfo) *MusicLinks {
+	links := &MusicLinks{}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		if info.Platform == "Spotify" {
+			links.Spotify = info.OriginalURL
+		} else {
+			links.Spotify = mb.searchSpotify(info)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if info.Platform == "YouTube Music" {
+			links.YouTubeMusic = info.OriginalURL
+		} else if info.Platform == "YouTube" {
+			if u := toYouTubeMusicURL(info.OriginalURL); u != "" {
+				links.YouTubeMusic = u
+			} else {
+				links.YouTubeMusic = mb.searchYouTube(info)
+			}
+		} else {
+			links.YouTubeMusic = mb.searchYouTube(info)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if info.Platform == "Apple Music" {
+			links.AppleMusic = info.OriginalURL
+		} else {
+			links.AppleMusic = mb.searchAppleMusic(info)
+		}
+	}()
+
+	wg.Wait()
+	return links
+}
+
+// ---------------------------
+// Spotify Search (Improved with Colly)
+// ---------------------------
+
+func (mb *MusicBot) searchSpotify(info *SongInfo) string {
+	key := normalizeQuery(info.Artist, info.Title)
+	if v, ok := mb.queryCache.Get("sp:" + key); ok {
+		return v
+	}
+
+	query := key
+	searchURL := fmt.Sprintf("https://open.spotify.com/search/%s", url.QueryEscape(query))
+
+	// Try with standard HTTP first
+	if resp, err := mb.fetch(searchURL); err == nil {
+		func() {
+			defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+			body, err := io.ReadAll(resp.Body)
+			if err == nil {
+				// Look for spotify:track: URI
+				if m := reSpotifyURI.FindSubmatch(body); len(m) == 2 {
+					u := fmt.Sprintf("https://open.spotify.com/track/%s", m[1])
+					mb.queryCache.Set("sp:"+key, u, mb.config.CacheTTL)
+					return
+				}
+
+				// Look for track links
+				if m := reSpotifyTrack.FindSubmatch(body); len(m) == 2 {
+					u := canonicalSpotifyTrack(string(body))
+					if u != "" {
+						mb.queryCache.Set("sp:"+key, u, mb.config.CacheTTL)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// DuckDuckGo fallback
+	if u := mb.searchSpotifyViaDDG(info.Artist, info.Title); u != "" {
+		mb.queryCache.Set("sp:"+key, u, mb.config.CacheTTL)
+		return u
+	}
+
+	return searchURL
+}
+
+func (mb *MusicBot) searchSpotifyViaDDG(artist, title string) string {
+	t := normalizeForMatch(title)
+	a := normalizeForMatch(artist)
+
+	// Pass 1: Exact (quoted) search
+	parts := []string{"site:open.spotify.com/track"}
+	if t != "" {
+		parts = append(parts, fmt.Sprintf(`"%s"`, t))
+	}
+	if a != "" {
+		parts = append(parts, fmt.Sprintf(`"%s"`, a))
+	}
+
+	q := strings.Join(parts, " ")
+	ddgURL := fmt.Sprintf("https://duckduckgo.com/html/?q=%s", url.QueryEscape(q))
+
+	if result := mb.searchDDGPage(ddgURL); result != "" {
+		return result
+	}
+
+	// Pass 2: Loose search
+	if t == "" && a == "" {
+		return ""
+	}
+
+	q2 := fmt.Sprintf("site:open.spotify.com/track %s %s", t, a)
+	ddgURL2 := fmt.Sprintf("https://duckduckgo.com/html/?q=%s", url.QueryEscape(strings.TrimSpace(q2)))
+
+	return mb.searchDDGPage(ddgURL2)
+}
+
+func (mb *MusicBot) searchDDGPage(ddgURL string) string {
+	resp, err := mb.fetch(ddgURL)
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [DDG] Fetch error: %v", err)
+		}
+		return ""
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	var result string
+	doc.Find("a").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		href, exists := s.Attr("href")
+		if !exists {
+			return true
+		}
+
+		resolved := resolveDDGLink(href)
+		if track := canonicalSpotifyTrack(resolved); track != "" {
+			result = track
+			return false
+		}
+
+		// Try album to track conversion
+		if reSpotifyAlbum.MatchString(resolved) {
+			if track := mb.tryAlbumToTrack(resolved); track != "" {
+				result = track
+				return false
+			}
+		}
+
+		return true
+	})
+
+	return result
+}
+
+func (mb *MusicBot) tryAlbumToTrack(albumURL string) string {
+	resp, err := mb.fetch(albumURL)
+	if err != nil {
+		return ""
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	// Look for spotify:track: URI
+	if m := reSpotifyURI.FindSubmatch(body); len(m) == 2 {
+		return fmt.Sprintf("https://open.spotify.com/track/%s", m[1])
+	}
+
+	// Look for track links
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
+		return ""
+	}
+
+	var track string
+	doc.Find("a").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		href, _ := s.Attr("href")
+		if href != "" {
+			if u := canonicalSpotifyTrack(href); u != "" {
+				track = u
+				return false
+			}
+		}
+		return true
+	})
+
+	return track
+}
+
+// ---------------------------
+// YouTube Search
+// ---------------------------
+
+func (mb *MusicBot) searchYouTube(info *SongInfo) string {
+	key := normalizeQuery(info.Artist, info.Title)
+	if v, ok := mb.queryCache.Get("yt:" + key); ok {
+		return v
+	}
+
+	query := key
+
+	// Try YouTube Music search
+	ytMusicURL := fmt.Sprintf("https://music.youtube.com/search?q=%s", url.QueryEscape(query))
+	if videoID := mb.searchYouTubeViaPage(ytMusicURL, info); videoID != "" {
+		u := fmt.Sprintf("https://music.youtube.com/watch?v=%s", videoID)
+		mb.queryCache.Set("yt:"+key, u, mb.config.CacheTTL)
+		return u
+	}
+
+	// Fallback to regular YouTube
+	ytURL := fmt.Sprintf("https://www.youtube.com/results?search_query=%s", url.QueryEscape(query))
+	if videoID := mb.searchYouTubeViaPage(ytURL, info); videoID != "" {
+		u := fmt.Sprintf("https://music.youtube.com/watch?v=%s", videoID)
+		mb.queryCache.Set("yt:"+key, u, mb.config.CacheTTL)
+		return u
+	}
+
+	return ytMusicURL
+}
+
+func (mb *MusicBot) searchYouTubeViaPage(searchURL string, info *SongInfo) string {
+	resp, err := mb.fetch(searchURL)
+	if err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [YouTube] Search fetch error: %v", err)
+		}
+		return ""
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	// Find ytInitialData
+	re := regexp.MustCompile(`ytInitialData\s*=\s*(\{.+?\});`)
+	matches := re.FindSubmatch(body)
+	if len(matches) < 2 {
+		return ""
+	}
+
+	var data interface{}
+	if err := json.Unmarshal(matches[1], &data); err != nil {
+		if mb.config.Debug {
+			log.Printf("🔍 [YouTube] JSON parse error: %v", err)
+		}
+		return ""
+	}
+
+	candidates := collectYouTubeCandidates(data)
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	// Score candidates
+	bestScore := -999
+	bestID := ""
+
+	for _, c := range candidates {
+		score := scoreYouTubeCandidate(c, info.Artist, info.Title)
+		if score > bestScore {
+			bestScore = score
+			bestID = c.ID
+		}
+	}
+
+	if bestID != "" {
+		return bestID
+	}
+
+	if len(candidates) > 0 {
+		return candidates[0].ID
+	}
+
+	return ""
+}
+
+func collectYouTubeCandidates(v interface{}) []YouTubeCandidate {
+	var result []YouTubeCandidate
+	collectYouTubeCandidatesRecursive(v, &result)
+	return result
+}
+
+func collectYouTubeCandidatesRecursive(v interface{}, out *[]YouTubeCandidate) {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		var id, title, channel string
+		if vr, ok := x["videoId"].(string); ok {
+			id = vr
+		}
+
+		if t, ok := x["title"].(map[string]interface{}); ok {
+			if runs, ok := t["runs"].([]interface{}); ok && len(runs) > 0 {
+				if m, ok := runs[0].(map[string]interface{}); ok {
+					if tx, ok := m["text"].(string); ok {
+						title = tx
+					}
+				}
+			} else if st, ok := t["simpleText"].(string); ok {
+				title = st
+			}
+		}
+
+		if lb, ok := x["longBylineText"].(map[string]interface{}); ok {
+			if runs, ok := lb["runs"].([]interface{}); ok && len(runs) > 0 {
+				if m, ok := runs[0].(map[string]interface{}); ok {
+					if tx, ok := m["text"].(string); ok {
+						channel = tx
+					}
+				}
+			}
+		} else if ow, ok := x["ownerText"].(map[string]interface{}); ok {
+			if runs, ok := ow["runs"].([]interface{}); ok && len(runs) > 0 {
+				if m, ok := runs[0].(map[string]interface{}); ok {
+					if tx, ok := m["text"].(string); ok {
+						channel = tx
+					}
+				}
+			}
+		}
+
+		if id != "" {
+			*out = append(*out, YouTubeCandidate{ID: id, Title: title, Channel: channel})
+		}
+
+		for _, vv := range x {
+			collectYouTubeCandidatesRecursive(vv, out)
+		}
+	case []interface{}:
+		for _, vv := range x {
+			collectYouTubeCandidatesRecursive(vv, out)
+		}
+	}
+}
+
+func scoreYouTubeCandidate(c YouTubeCandidate, wantArtist, wantTitle string) int {
+	score := 0
+	na := normalizeForMatch(wantArtist)
+	nt := normalizeForMatch(wantTitle)
+	ct := normalizeForMatch(c.Title)
+	cc := normalizeForMatch(c.Channel)
+
+	if strings.Contains(ct, nt) {
+		score += 4
+	}
+	if strings.Contains(ct, na) {
+		score += 3
+	}
+	if strings.Contains(cc, na) {
+		score += 2
+	}
+	if strings.HasSuffix(cc, " - topic") {
+		score += 2
+	}
+
+	bad := []string{"cover", "lyrics", "lyric", "live", "karaoke", "sped up", "speed up", "nightcore", "8d", "slowed"}
+	for _, b := range bad {
+		if strings.Contains(ct, b) {
+			score -= 2
+		}
+	}
+	if strings.Contains(ct, "remix") && !strings.Contains(nt, "remix") {
+		score -= 1
+	}
+
+	return score
+}
+
+// ---------------------------
+// Apple Music Search
+// ---------------------------
+
+func (mb *MusicBot) searchAppleMusic(info *SongInfo) string {
+	key := normalizeQuery(info.Artist, info.Title)
+	if v, ok := mb.queryCache.Get("am:" + key); ok {
+		return v
+	}
+
+	query := key
+	searchURL := fmt.Sprintf("https://music.apple.com/search?term=%s", url.QueryEscape(query))
+
+	// Try iTunes Search API
+	country := "US"
+	apiURL := fmt.Sprintf("https://itunes.apple.com/search?term=%s&media=music&entity=song&limit=10&country=%s",
+		url.QueryEscape(query), country)
+
+	resp, err := mb.fetch(apiURL)
+	if err == nil {
+		defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+		var data struct {
+			Results []struct {
+				TrackViewURL string `json:"trackViewUrl"`
+				TrackName    string `json:"trackName"`
+				ArtistName   string `json:"artistName"`
+			} `json:"results"`
+		}
+
+		if json.NewDecoder(resp.Body).Decode(&data) == nil && len(data.Results) > 0 {
+			wantT := normalizeForMatch(info.Title)
+			wantA := normalizeForMatch(info.Artist)
+
+			bestScore := -999
+			bestURL := ""
+
+			for _, result := range data.Results {
+				if result.TrackViewURL == "" {
+					continue
+				}
+
+				t := normalizeForMatch(result.TrackName)
+				a := normalizeForMatch(result.ArtistName)
+
+				score := 0
+				if wantT != "" && strings.Contains(t, wantT) {
+					score += 3
+				}
+				if wantA != "" && strings.Contains(a, wantA) {
+					score += 3
+				}
+
+				if score > bestScore {
+					bestScore = score
+					bestURL = strings.Replace(result.TrackViewURL, "itunes.apple.com", "music.apple.com", 1)
+				}
+			}
+
+			if bestScore >= 3 && bestURL != "" {
+				mb.queryCache.Set("am:"+key, bestURL, mb.config.CacheTTL)
+				return bestURL
+			}
+		}
+	}
+
+	return searchURL
+}
+
+// ---------------------------
+// Helper Functions
+// ---------------------------
+
+func cleanPlatformNoise(s string) string {
+	s = strings.ReplaceAll(s, "\u00A0", " ")
+	s = reAppleMusicSuffix.ReplaceAllString(s, "")
+	s = rePlatformNames.ReplaceAllString(s, "")
+	for fancy, plain := range fancyQuotes {
+		s = strings.ReplaceAll(s, fancy, plain)
+	}
+	return strings.TrimSpace(s)
+}
+
+func cleanTitleArtist(t, a string) (string, string) {
+	return cleanPlatformNoise(t), cleanPlatformNoise(a)
+}
+
+func isAlbumish(s string) bool {
+	ls := strings.ToLower(strings.TrimSpace(s))
+	if ls == "" {
+		return false
+	}
+	hints := []string{"original soundtrack", "soundtrack", "ost", "score", "music from", "season ", " vol.", " volume ", ":"}
+	for _, h := range hints {
+		if strings.Contains(ls, h) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeArtistList(s string) bool {
+	ls := strings.ToLower(strings.TrimSpace(s))
+	if ls == "" {
+		return false
+	}
+	if (strings.Contains(ls, ",") || strings.Contains(ls, " & ") || strings.Contains(ls, " and ") ||
+		strings.Contains(ls, " feat") || strings.Contains(ls, " featuring ")) &&
+		!strings.Contains(ls, ":") && !strings.Contains(ls, "-") {
+		return true
+	}
+	return false
+}
+
+func normalizeQuery(artist, title string) string {
+	clean := func(s string) string {
+		s = reParenBlock.ReplaceAllString(s, "")
+		s = reFeat.ReplaceAllString(s, "")
+
+		ls := strings.ToLower(s)
+		ls = strings.ReplaceAll(ls, "\u00A0", " ")
+		ls = reAppleMusicSuffix.ReplaceAllString(ls, "")
+		ls = rePlatformNames.ReplaceAllString(ls, "")
+
+		for fancy, plain := range fancyQuotes {
+			ls = strings.ReplaceAll(ls, fancy, plain)
+		}
+
+		repls := []string{
+			" - single", "", " - ep", "", " - album", "",
+			" – single", "", " – ep", "",
+			" remastered", "", " - remaster", "", " remaster", "",
+			" - radio edit", "", " radio edit", "",
+			" official video", "", " lyric video", "", " lyrics", "",
+		}
+		for i := 0; i < len(repls); i += 2 {
+			ls = strings.ReplaceAll(ls, repls[i], repls[i+1])
+		}
+
+		return strings.Join(strings.Fields(ls), " ")
+	}
+
+	a := clean(artist)
+	t := clean(title)
+	return strings.TrimSpace(a + " " + t)
+}
+
+func normalizeForMatch(s string) string {
+	s = strings.ToLower(s)
+	s = reParenBlock.ReplaceAllString(s, "")
+	s = strings.NewReplacer(
+		"-", " ", "—", " ", "–", " ", "·", " ", ".", " ", ",", " ",
+		"!", " ", "?", " ", "/", " ", "&", " and ", "'", " ", "'", " ",
+	).Replace(s)
+
+	for fancy, plain := range fancyQuotes {
+		s = strings.ReplaceAll(s, fancy, plain)
+	}
+
+	s = rePlatformNames.ReplaceAllString(s, "")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func splitFromOgTitle(ogTitle, ogDesc string) (string, string) {
+	if ogTitle == "" {
+		return "", ""
+	}
+
+	t := strings.TrimSuffix(ogTitle, " | Spotify")
+	t = strings.ReplaceAll(t, "\u00A0", " ")
+	t = strings.TrimSpace(t)
+
+	// Case 1: "... by ..."
+	if strings.Contains(strings.ToLower(t), " by ") {
+		idx := strings.Index(strings.ToLower(t), " by ")
+		return strings.TrimSpace(t[:idx]), strings.TrimSpace(t[idx+4:])
+	}
+
+	// Case 2: Dash variants
+	parts := reDash.Split(t, 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+
+	left := strings.TrimSpace(parts[0])
+	right := strings.TrimSpace(parts[1])
+
+	// Derive hint from description
+	var hintArtist string
+	if ogDesc != "" {
+		descParts := reMidDotSep.Split(strings.ReplaceAll(ogDesc, "\u00A0", " "), -1)
+		if len(descParts) >= 1 {
+			hintArtist = strings.TrimSpace(descParts[0])
+		}
+	}
+
+	ln := normalizeForMatch(left)
+	rn := normalizeForMatch(right)
+	an := normalizeForMatch(hintArtist)
+
+	// Match hint
+	if an != "" {
+		if ln == an {
+			return right, left // Artist — Title
+		}
+		if rn == an {
+			return left, right // Title — Artist
+		}
+	}
+
+	// Heuristic
+	if looksLikeArtistList(right) {
+		return left, right
+	}
+	if looksLikeArtistList(left) {
+		return right, left
+	}
+
+	// Default: Title — Artist
+	return left, right
+}
+
+func canonicalSpotifyTrack(u string) string {
+	if m := reSpotifyTrack.FindStringSubmatch(u); len(m) == 2 {
+		return fmt.Sprintf("https://open.spotify.com/track/%s", m[1])
+	}
+	return ""
+}
+
+func resolveDDGLink(href string) string {
+	if href == "" {
+		return ""
+	}
+
+	u := href
+	if strings.HasPrefix(u, "//") {
+		u = "https:" + u
+	} else if strings.HasPrefix(u, "/") && !strings.HasPrefix(u, "/track/") {
+		u = "https://duckduckgo.com" + u
+	}
+
+	parsed, err := url.Parse(u)
+	if err == nil {
+		if strings.Contains(parsed.Host, "duckduckgo.com") && strings.HasPrefix(parsed.Path, "/l/") {
+			if v := parsed.Query().Get("uddg"); v != "" {
+				if dec, err := url.QueryUnescape(v); err == nil {
+					return dec
+				}
+				return v
+			}
+		}
+	}
+
+	return u
+}
 
 func youtubeVideoIDFromURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return ""
 	}
+
 	switch strings.ToLower(u.Host) {
 	case "youtu.be":
 		return strings.Trim(u.Path, "/")
 	default:
-		v := u.Query().Get("v")
-		if v != "" {
-			return v
-		}
-		return ""
+		return u.Query().Get("v")
 	}
 }
 
 func toYouTubeMusicURL(raw string) string {
 	if id := youtubeVideoIDFromURL(raw); id != "" {
-		return "https://music.youtube.com/watch?v=" + id
+		return fmt.Sprintf("https://music.youtube.com/watch?v=%s", id)
 	}
 	return ""
 }
 
-// ---------------------------
-// main
-// ---------------------------
-
 func envBool(key string, def bool) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	if v == "1" || v == "true" || v == "yes" || v == "y" {
+	switch v {
+	case "1", "true", "yes", "y":
 		return true
-	}
-	if v == "0" || v == "false" || v == "no" || v == "n" {
+	case "0", "false", "no", "n":
 		return false
+	default:
+		return def
 	}
-	return def
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ---------------------------
+// Fuzzy Matching
+// ---------------------------
+
+// calculateSimilarity returns a similarity score between 0 and 1
+// Uses Levenshtein distance normalized by the longer string length
+func calculateSimilarity(s1, s2 string) float64 {
+	if s1 == "" || s2 == "" {
+		return 0
+	}
+
+	// Normalize for comparison
+	n1 := normalizeForMatch(s1)
+	n2 := normalizeForMatch(s2)
+
+	if n1 == n2 {
+		return 1.0
+	}
+
+	distance := levenshtein.DistanceForStrings([]rune(n1), []rune(n2), levenshtein.DefaultOptions)
+	maxLen := max(len(n1), len(n2))
+
+	if maxLen == 0 {
+		return 0
+	}
+
+	return 1.0 - float64(distance)/float64(maxLen)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// validateSearchResult checks if a search result matches the original query
+// using fuzzy string matching. Returns true if confidence is above threshold.
+func (mb *MusicBot) validateSearchResult(foundTitle, foundArtist, wantTitle, wantArtist string) bool {
+	titleSim := calculateSimilarity(foundTitle, wantTitle)
+	artistSim := calculateSimilarity(foundArtist, wantArtist)
+
+	// Combined score: title is more important (60%) than artist (40%)
+	combinedScore := (titleSim * 0.6) + (artistSim * 0.4)
+
+	if mb.config.Debug {
+		mb.logger.Debug("Fuzzy match validation",
+			zap.String("found_title", foundTitle),
+			zap.String("found_artist", foundArtist),
+			zap.String("want_title", wantTitle),
+			zap.String("want_artist", wantArtist),
+			zap.Float64("title_similarity", titleSim),
+			zap.Float64("artist_similarity", artistSim),
+			zap.Float64("combined_score", combinedScore),
+			zap.Float64("threshold", mb.config.FuzzyMatchThreshold))
+	}
+
+	return combinedScore >= mb.config.FuzzyMatchThreshold
+}
+
+// ---------------------------
+// Text Mirror Fallback
+// ---------------------------
+
+// fetchViaTextMirror uses r.jina.ai to fetch pre-rendered content
+// This helps with JavaScript-heavy pages that require rendering
+func (mb *MusicBot) fetchViaTextMirror(targetURL string) (*http.Response, error) {
+	if mb.config.TextMirrorURL == "" {
+		return nil, fmt.Errorf("text mirror URL not configured")
+	}
+
+	mirrorURL := mb.config.TextMirrorURL + targetURL
+
+	if mb.config.Debug {
+		mb.logger.Debug("Fetching via text mirror",
+			zap.String("original_url", targetURL),
+			zap.String("mirror_url", mirrorURL))
+	}
+
+	return mb.fetch(mirrorURL)
+}
+
+// ---------------------------
+// Main
+// ---------------------------
+
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	telegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if telegramToken == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN environment variable is required")
+		log.Fatal("❌ TELEGRAM_BOT_TOKEN environment variable is required")
 	}
 
 	config := &Config{
-		TelegramToken:      telegramToken,
-		Debug:              envBool("BOT_DEBUG", false),
-		SpotifyDDGFallback: envBool("SPOTIFY_DDG_FALLBACK", false), // preserved for compat; we still use DDG fallback if primary fails
+		TelegramToken:          telegramToken,
+		Debug:                  envBool("BOT_DEBUG", false),
+		MaxConcurrentFetches:   8,
+		MaxConcurrentMessages:  32,
+		RequestTimeout:         12 * time.Second,
+		RetryAttempts:          2,
+		RetryMinDelay:          150 * time.Millisecond,
+		RetryMaxDelay:          350 * time.Millisecond,
+		CacheTTL:               24 * time.Hour,
+		NegativeCacheTTL:       5 * time.Minute,  // Cache failures for shorter period
+		FuzzyMatchThreshold:    0.7,              // 70% similarity threshold
+		CircuitBreakerMaxFails: 5,                // Open after 5 failures
+		CircuitBreakerTimeout:  60 * time.Second, // Reset after 60s
+		TextMirrorURL:          "https://r.jina.ai/",
 	}
 
 	bot, err := NewMusicBot(config)
@@ -1687,7 +2206,7 @@ func main() {
 	}
 
 	log.Println("🎵 Music Link Converter Bot is running…")
-	log.Println("No API keys required — using web scraping!")
+	log.Println("📡 No API keys required - using web scraping!")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

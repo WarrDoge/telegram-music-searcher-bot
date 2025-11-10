@@ -14,6 +14,7 @@ A simple Telegram bot that converts music links between Spotify, YouTube Music, 
 ## 📋 Prerequisites
 
 - Go 1.21 or higher
+- [direnv](https://direnv.net/) (recommended for managing environment variables)
 - Telegram Bot Token (the only credential you need!)
 
 ## 🚀 Quick Setup
@@ -27,29 +28,51 @@ A simple Telegram bot that converts music links between Spotify, YouTube Music, 
 ### 2. Clone and Setup
 
 ```bash
-# Create project directory
-mkdir telegram-music-bot
-cd telegram-music-bot
+# Clone repository
+git clone <your-repo>
+cd telegram-music-searcher-bot
 
-# Copy the main.go and go.mod files here
-# Then install dependencies
+# Install dependencies
 go mod download
 ```
 
-### 3. Run the Bot
+### 3. Configure Environment (using direnv)
 
 ```bash
-# Set your bot token and run
-export TELEGRAM_BOT_TOKEN="your_bot_token_here"
-go run main.go
+# Install direnv (macOS)
+brew install direnv
+
+# Or Linux
+sudo apt install direnv  # Debian/Ubuntu
+sudo yum install direnv  # RHEL/CentOS
+
+# Add direnv hook to your shell (~/.bashrc or ~/.zshrc)
+eval "$(direnv hook bash)"  # for bash
+eval "$(direnv hook zsh)"   # for zsh
+
+# Setup environment
+cp .envrc.example .envrc
+nano .envrc  # Edit with your values
+
+# Allow direnv to load the file
+direnv allow
 ```
 
-Or create a simple run script `run.sh`:
+Your `.envrc` file should look like:
+```bash
+export TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+export BOT_DEBUG=false
+```
+
+### 4. Run the Bot
 
 ```bash
-#!/bin/bash
-export TELEGRAM_BOT_TOKEN="your_bot_token_here"
+# Environment variables are automatically loaded by direnv
 go run main.go
+
+# Or use Makefile
+make test  # Run tests
+make build # Build binary
 ```
 
 ## 💬 Usage
