@@ -17,17 +17,17 @@ help:  # Show this help
 all: deploy  # Run deploy
 
 deps:  # Install go dependencies
-	go mod tidy
+	@go mod tidy
 
 lint: deps  # Run linter
-	golangci-lint run || true
+	@golangci-lint run || true
 
 test: lint  # Run unit and integration tests
 	go test -race -coverprofile=coverage.out ./...
 	@rm coverage.out
 
 build: test # Build a statically linked binary
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o $(APP)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP)
 
 deploy: build  # Render a service file and deploy to remote server
 	# Stop service (remote sudo)
