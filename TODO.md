@@ -1,2 +1,1 @@
 - Bug: \* in song name.
-- Feat: spotify.link support.

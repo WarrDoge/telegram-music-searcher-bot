@@ -27,7 +27,7 @@ test: lint  # Run unit and integration tests
 	@rm coverage.out
 
 build: test # Build a statically linked binary
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP)
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP) ./cmd/bot
 
 deploy: build  # Render a service file and deploy to remote server
 	# Stop service (remote sudo)
