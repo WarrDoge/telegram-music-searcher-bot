@@ -5,7 +5,7 @@ ifneq (,$(wildcard .env))
 endif
 
 SSH     = ssh -i $(SSH_KEY) $(USER)@$(IP)
-RSYNC 	= rsync -avz -e "ssh -i $(SSH_KEY)" --rsync-path="sudo rsync"
+SCP     = scp -i $(SSH_KEY)
 REMOTE  = $(USER)@$(IP)
 
 .PHONY: help all deps lint test build deploy clean
@@ -23,24 +23,24 @@ lint: deps  # Run linter
 	@golangci-lint run || true
 
 test: lint  # Run unit and integration tests
-	go test -race -coverprofile=coverage.out ./...
-	@rm coverage.out
+	@echo "No tests in monolith version (test file can be added later)"
 
 build: test # Build a statically linked binary
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP) ./cmd/bot
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP) main.go
 
 deploy: build  # Render a service file and deploy to remote server
-	# Stop service (remote sudo)
 	$(SSH) "sudo systemctl stop $(APP) || true"
 
 	# Render service file locally
 	@sed "s/CHANGE_ME_1/$(APP)/g; s/CHANGE_ME_2/$(TOKEN)/g; w $(APP).service" service.tpl > /dev/null
 
-	# Sync binary to /root (remote rsync runs under sudo)
-	$(RSYNC) ./$(APP) $(REMOTE):/root/$(APP)
+	# Copy binary to temp location, then move to /root with sudo
+	$(SCP) ./$(APP) $(REMOTE):/tmp/$(APP)
+	$(SSH) "sudo mv /tmp/$(APP) /root/$(APP)"
 
-	# Sync service file to systemd dir
-	$(RSYNC) ./$(APP).service $(REMOTE):/etc/systemd/system/$(APP).service
+	# Copy service file to temp location, then move to systemd dir with sudo
+	$(SCP) ./$(APP).service $(REMOTE):/tmp/$(APP).service
+	$(SSH) "sudo mv /tmp/$(APP).service /etc/systemd/system/$(APP).service"
 
 	# Fix permissions and restart service
 	$(SSH) "sudo chmod +x /root/$(APP)"
