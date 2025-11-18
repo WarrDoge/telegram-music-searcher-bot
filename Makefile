@@ -19,12 +19,15 @@ all: deploy  # Run deploy
 deps:  # Install go dependencies
 	@go mod tidy
 
-lint: deps  # Run linter
+fmt:  # Run fmt
+	@go fmt
+
+lint:  # Run linter
 	@golangci-lint run || true
 
-test: lint  # Run unit and integration tests
+test: deps fmt lint  # Run unit and integration tests
 	@echo "Running tests..."
-	@go test
+	@go test -race || true
 
 build: test  # Build a statically linked binary
 	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP) main.go

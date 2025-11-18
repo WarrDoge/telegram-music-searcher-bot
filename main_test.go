@@ -107,10 +107,10 @@ func TestNormalizeForMatch(t *testing.T) {
 
 func TestCleanYouTubeInfo(t *testing.T) {
 	tests := []struct {
-		name          string
-		title         string
-		artist        string
-		expectedTitle string
+		name           string
+		title          string
+		artist         string
+		expectedTitle  string
 		expectedArtist string
 	}{
 		{
@@ -158,10 +158,10 @@ func TestCleanYouTubeInfo(t *testing.T) {
 
 func TestSplitFromOgTitle(t *testing.T) {
 	tests := []struct {
-		name          string
-		ogTitle       string
-		ogDesc        string
-		expectedTitle string
+		name           string
+		ogTitle        string
+		ogDesc         string
+		expectedTitle  string
 		expectedArtist string
 	}{
 		{
