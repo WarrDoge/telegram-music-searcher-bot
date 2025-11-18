@@ -8,7 +8,7 @@ SSH     = ssh -i $(SSH_KEY) $(USER)@$(IP)
 SCP     = scp -i $(SSH_KEY)
 REMOTE  = $(USER)@$(IP)
 
-.PHONY: help all deps lint test build deploy clean
+.PHONY: help all deps lint test test-unit test-integration build deploy clean
 
 help:  # Show this help
 	@echo "Targets:"
@@ -23,9 +23,10 @@ lint: deps  # Run linter
 	@golangci-lint run || true
 
 test: lint  # Run unit and integration tests
-	@echo "No tests in monolith version (test file can be added later)"
+	@echo "Running tests..."
+	@go test
 
-build: test # Build a statically linked binary
+build: test  # Build a statically linked binary
 	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(APP) main.go
 
 deploy: build  # Render a service file and deploy to remote server
